@@ -1,0 +1,78 @@
+name: Teliti Data Backup - Connection Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-backup-write:
+    runs-on: ubuntu-24.04
+
+    env:
+      TZ: Asia/Taipei
+
+    steps:
+      - name: Check out private data repository
+        uses: actions/checkout@v7
+        with:
+          repository: aynuddin0587/teliti-data-backup
+          ref: main
+          path: teliti-data-backup
+          ssh-key: ${{ secrets.TELITI_DATA_DEPLOY_KEY }}
+          persist-credentials: true
+          fetch-depth: 1
+
+      - name: Verify private repository checkout
+        working-directory: teliti-data-backup
+        run: |
+          echo "Repository remote:"
+          git remote -v
+
+          echo ""
+          echo "Current branch:"
+          git branch --show-current
+
+          echo ""
+          echo "Current files:"
+          find . -maxdepth 2 -type f -not -path "./.git/*" -print
+
+      - name: Create connection test marker
+        working-directory: teliti-data-backup
+        run: |
+          mkdir -p system
+
+          {
+            echo "Teliti GitHub Actions backup connection test"
+            echo "source_repository=${GITHUB_REPOSITORY}"
+            echo "source_commit=${GITHUB_SHA}"
+            echo "workflow=${GITHUB_WORKFLOW}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "tested_at=$(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M:%S %Z')"
+          } > system/github_actions_connection_test.txt
+
+          echo "Marker contents:"
+          cat system/github_actions_connection_test.txt
+
+      - name: Commit and push connection test
+        working-directory: teliti-data-backup
+        run: |
+          git config user.name "teliti-github-actions"
+          git config user.email "teliti-github-actions@users.noreply.github.com"
+
+          git add system/github_actions_connection_test.txt
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Verify GitHub Actions backup write access"
+            git push origin main
+          fi
+
+      - name: Show final repository status
+        working-directory: teliti-data-backup
+        run: |
+          git status
+          git log --oneline -3
