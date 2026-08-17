@@ -1,0 +1,74 @@
+# ============================================================
+# Teliti scraper-code repository
+#
+# Default policy:
+# Ignore the entire research workspace and explicitly allow
+# only scraper code and repository infrastructure.
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 1. Ignore everything at repository root
+# ------------------------------------------------------------
+
+/*
+
+
+# ------------------------------------------------------------
+# 2. Repository infrastructure
+# ------------------------------------------------------------
+
+!/.gitignore
+!/README.md
+!/renv.lock
+
+# GitHub Actions
+!/.github/
+!/.github/**
+
+
+# ------------------------------------------------------------
+# 3. NMEMC / CNEMC scraper code
+# ------------------------------------------------------------
+
+!/nmemc/
+
+/nmemc/*
+
+!/nmemc/script/
+
+/nmemc/script/*
+
+!/nmemc/script/01_nmemc_water_archive.R
+!/nmemc/script/02_nmemc_surfacewater_archive.R
+
+
+# ------------------------------------------------------------
+# 4. Fujian surface-water scraper
+# ------------------------------------------------------------
+
+!/fujian_surfacewater/
+
+/fujian_surfacewater/*
+
+!/fujian_surfacewater/script/
+
+/fujian_surfacewater/script/*
+
+!/fujian_surfacewater/script/01_fujian_weekly_surfacewater_archive.R
+
+
+# ------------------------------------------------------------
+# 5. ONLIMO scraper code
+# ------------------------------------------------------------
+
+!/onlimo/
+
+/onlimo/*
+
+!/onlimo/script/
+
+/onlimo/script/*
+
+!/onlimo/script/01_onlimo_daily_archive.R
+!/onlimo/script/02_onlimo_historical_pollution_index.R
