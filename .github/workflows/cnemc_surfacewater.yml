@@ -1,4 +1,4 @@
-name: CNEMC Surface Water - Manual Test
+name: CNEMC Surface Water - Persistent Backup Test
 
 on:
   workflow_dispatch:
@@ -6,19 +6,34 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: cnemc-surfacewater-backup
+  cancel-in-progress: false
+
 jobs:
-  test-cnemc:
+  backup-cnemc:
     runs-on: ubuntu-24.04
 
     env:
       TZ: Asia/Taipei
       TELITI_TIMEZONE: Asia/Taipei
-      TELITI_DATA_ROOT: ${{ github.workspace }}/backup
       TELITI_COLLECTOR_ID: github_actions
+      TELITI_DATA_ROOT: ${{ github.workspace }}/run-data
+      TELITI_BACKUP_REPO: ${{ github.workspace }}/teliti-data-backup
 
     steps:
       - name: Check out scraper repository
         uses: actions/checkout@v7
+
+      - name: Check out private data backup repository
+        uses: actions/checkout@v7
+        with:
+          repository: aynuddin0587/teliti-data-backup
+          ref: main
+          path: teliti-data-backup
+          ssh-key: ${{ secrets.TELITI_DATA_DEPLOY_KEY }}
+          persist-credentials: true
+          fetch-depth: 1
 
       - name: Set up R
         uses: r-lib/actions/setup-r@v2
@@ -29,26 +44,52 @@ jobs:
       - name: Restore R environment
         uses: r-lib/actions/setup-renv@v2
 
-      - name: Show R environment
-        run: |
-          Rscript -e "cat('R version:', as.character(getRversion()), '\n')"
-          Rscript -e "cat('Library paths:\n'); print(.libPaths())"
-
       - name: Run CNEMC surface-water scraper
         run: |
           Rscript nmemc/script/02_nmemc_surfacewater_archive.R
 
-      - name: List generated files
-        if: always()
+      - name: Prepare persistent CNEMC backup
         run: |
-          echo "Generated files:"
-          find backup -type f -print 2>/dev/null || true
+          Rscript .github/scripts/prepare_cnemc_backup.R
 
-      - name: Upload test output
-        if: always()
+      - name: Show backup repository changes
+        working-directory: teliti-data-backup
+        run: |
+          echo "Candidate backup changes:"
+          git status --short
+
+      - name: Commit and push backup
+        working-directory: teliti-data-backup
+        run: |
+          git config user.name "teliti-github-actions"
+          git config user.email "teliti-github-actions@users.noreply.github.com"
+
+          git add cnemc_surfacewater/
+
+          if git diff --cached --quiet; then
+            echo "CNEMC snapshot and dictionaries are unchanged."
+            echo "Nothing to commit."
+          else
+            echo "Files to be committed:"
+            git diff --cached --name-status
+
+            git commit -m "Update CNEMC surface-water backup"
+            git push origin main
+          fi
+
+      - name: Show final backup status
+        working-directory: teliti-data-backup
+        run: |
+          git status
+          git log --oneline -3
+
+      - name: Upload diagnostics if workflow fails
+        if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: cnemc-surfacewater-test
-          path: backup/
+          name: cnemc-backup-failure-${{ github.run_id }}
+          path: |
+            run-data/nmemc/log/
+            run-data/nmemc/data/surfacewater/source/surfacewater_current_meta.rds
           if-no-files-found: warn
           retention-days: 7
