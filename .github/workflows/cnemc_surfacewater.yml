@@ -1,0 +1,53 @@
+name: CNEMC Surface Water - Manual Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-cnemc:
+    runs-on: ubuntu-24.04
+
+    env:
+      TZ: Asia/Taipei
+      TELITI_DATA_ROOT: ${{ github.workspace }}/backup
+      TELITI_COLLECTOR_ID: github_actions
+
+    steps:
+      - name: Check out scraper repository
+        uses: actions/checkout@v7
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: '4.6.1'
+          use-public-rspm: true
+
+      - name: Restore R environment
+        uses: r-lib/actions/setup-renv@v2
+
+      - name: Show R environment
+        run: |
+          Rscript -e "cat('R version:', as.character(getRversion()), '\n')"
+          Rscript -e "cat('Library paths:\n'); print(.libPaths())"
+
+      - name: Run CNEMC surface-water scraper
+        run: |
+          Rscript nmemc/script/02_nmemc_surfacewater_archive.R
+
+      - name: List generated files
+        if: always()
+        run: |
+          echo "Generated files:"
+          find backup -type f -print 2>/dev/null || true
+
+      - name: Upload test output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cnemc-surfacewater-test
+          path: backup/
+          if-no-files-found: warn
+          retention-days: 7
