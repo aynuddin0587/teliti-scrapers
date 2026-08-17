@@ -10,11 +10,11 @@ jobs:
   test-cnemc:
     runs-on: ubuntu-24.04
 
-env:
-  TZ: Asia/Taipei
-  TELITI_TIMEZONE: Asia/Taipei
-  TELITI_DATA_ROOT: ${{ github.workspace }}/backup
-  TELITI_COLLECTOR_ID: github_actions
+    env:
+      TZ: Asia/Taipei
+      TELITI_TIMEZONE: Asia/Taipei
+      TELITI_DATA_ROOT: ${{ github.workspace }}/backup
+      TELITI_COLLECTOR_ID: github_actions
 
     steps:
       - name: Check out scraper repository
