@@ -58,6 +58,23 @@ BASE_DIR <- file.path(
   "nmemc"
 )
 
+# Collector/source time and provenance
+COLLECTOR_TZ <- Sys.getenv(
+  "TELITI_TIMEZONE",
+  unset = "Asia/Taipei"
+)
+
+SOURCE_TZ <- "Asia/Shanghai"
+
+COLLECTOR_ID <- Sys.getenv(
+  "TELITI_COLLECTOR_ID",
+  unset = "local_pc"
+)
+
+GITHUB_RUN_ID <- Sys.getenv("GITHUB_RUN_ID", unset = "")
+GITHUB_RUN_ATTEMPT <- Sys.getenv("GITHUB_RUN_ATTEMPT", unset = "")
+GITHUB_SHA <- Sys.getenv("GITHUB_SHA", unset = "")
+
 MAIN_URL <- "https://szzdjc.cnemc.cn:8070/GJZ/Business/Publish/Main.html"
 ENDPOINT <- "https://szzdjc.cnemc.cn:8070/GJZ/Ajax/Publish.ashx"
 ORIGIN   <- "https://szzdjc.cnemc.cn:8070"
@@ -86,14 +103,18 @@ MN_NAME  <- as.character(getOption("nmemc.surfacewater.mn_name", ""))
 PAGE_DELAY_SECONDS <- suppressWarnings(as.numeric(getOption("nmemc.surfacewater.page_delay", 0.25)))
 if (is.na(PAGE_DELAY_SECONDS) || PAGE_DELAY_SECONDS < 0) PAGE_DELAY_SECONDS <- 0.25
 
-log_file <- file.path(
-  LOG_DIR,
-  sprintf("nmemc_surfacewater_%s.log", format(Sys.Date(), "%Y%m%d"))
+sprintf(
+  "nmemc_surfacewater_%s.log",
+  format(Sys.time(), "%Y%m%d", tz = COLLECTOR_TZ)
 )
 
 log_msg <- function(...) {
   msg <- paste0(...)
-  line <- sprintf("%s | %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), msg)
+  line <- sprintf(
+  "%s | %s",
+  format(Sys.time(), "%Y-%m-%d %H:%M:%S", tz = COLLECTOR_TZ),
+  msg
+)
   cat(line, "\n")
   cat(line, "\n", file = log_file, append = TRUE)
 }
@@ -520,6 +541,25 @@ parse_snapshot <- function(bundle) {
   # so observation_datetime adds an explicitly inferred year for longitudinal
   # archiving while monitoring_time_raw remains untouched.
   dat <- recompute_observation_hashes(dat, source_cols)
+  dat$collector_id <- COLLECTOR_ID
+
+dat$github_run_id <- if (nzchar(GITHUB_RUN_ID)) {
+  GITHUB_RUN_ID
+} else {
+  NA_character_
+}
+
+dat$github_run_attempt <- if (nzchar(GITHUB_RUN_ATTEMPT)) {
+  GITHUB_RUN_ATTEMPT
+} else {
+  NA_character_
+}
+
+dat$scraper_code_commit <- if (nzchar(GITHUB_SHA)) {
+  GITHUB_SHA
+} else {
+  NA_character_
+}
 
   list(data = tibble::as_tibble(dat), dictionary = dictionary)
 }
@@ -537,8 +577,16 @@ archive_snapshot_if_changed <- function(bundle) {
   changed <- is.na(old_md5) || !identical(old_md5, bundle$snapshot_md5)
 
   if (changed) {
-    stamp <- format(bundle$collected_at, "%Y%m%d_%H%M%S")
-    year_dir <- file.path(ARCHIVE_DIR, format(bundle$collected_at, "%Y"))
+stamp <- format(
+  bundle$collected_at,
+  "%Y%m%d_%H%M%S",
+  tz = COLLECTOR_TZ
+)
+
+year_dir <- file.path(
+  ARCHIVE_DIR,
+  format(bundle$collected_at, "%Y", tz = COLLECTOR_TZ)
+)
     dir.create(year_dir, recursive = TRUE, showWarnings = FALSE)
     archive_path <- file.path(year_dir, sprintf("surfacewater_%s_raw.rds", stamp))
     saveRDS(bundle, archive_path, compress = "xz")
@@ -582,8 +630,18 @@ fetch_area_river_dictionary <- function() {
   old_md5 <- if (file.exists(area_river_path)) unname(tools::md5sum(area_river_path)) else NA_character_
 
   if (is.na(old_md5) || !identical(old_md5, new_md5)) {
-    stamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
-    year_dir <- file.path(ARCHIVE_DIR, format(Sys.Date(), "%Y"))
+now <- Sys.time()
+
+stamp <- format(
+  now,
+  "%Y%m%d_%H%M%S",
+  tz = COLLECTOR_TZ
+)
+
+year_dir <- file.path(
+  ARCHIVE_DIR,
+  format(now, "%Y", tz = COLLECTOR_TZ)
+)
     dir.create(year_dir, recursive = TRUE, showWarnings = FALSE)
     archive_path <- file.path(year_dir, sprintf("area_river_%s.json", stamp))
     write_raw_atomic(raw_body, archive_path)
@@ -681,7 +739,11 @@ update_cumulative_master <- function(snapshot_data, run_time, source_cols) {
 
 append_run_manifest <- function(bundle, parsed, changed) {
   entry <- tibble::tibble(
-    collected_at = as.POSIXct(bundle$collected_at, tz = "Asia/Shanghai"),
+    collector_id = COLLECTOR_ID,
+github_run_id = if (nzchar(GITHUB_RUN_ID)) GITHUB_RUN_ID else NA_character_,
+github_run_attempt = if (nzchar(GITHUB_RUN_ATTEMPT)) GITHUB_RUN_ATTEMPT else NA_character_,
+scraper_code_commit = if (nzchar(GITHUB_SHA)) GITHUB_SHA else NA_character_,
+    collected_at = as.POSIXct(bundle$collected_at, tz = COLLECTOR_TZ),
     snapshot_md5 = bundle$snapshot_md5,
     changed = isTRUE(changed),
     total_pages = as.integer(bundle$total_pages),
