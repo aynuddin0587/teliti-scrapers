@@ -1,7 +1,11 @@
-name: CNEMC Surface Water - Persistent Backup Test
+name: CNEMC Surface Water Backup
 
 on:
   workflow_dispatch:
+
+  schedule:
+    - cron: "7,27,47 * * * *"
+      timezone: "Asia/Taipei"
 
 permissions:
   contents: read
@@ -38,7 +42,7 @@ jobs:
       - name: Set up R
         uses: r-lib/actions/setup-r@v2
         with:
-          r-version: '4.6.1'
+          r-version: "4.6.1"
           use-public-rspm: true
 
       - name: Restore R environment
