@@ -108,17 +108,29 @@ sprintf(
   format(Sys.time(), "%Y%m%d", tz = COLLECTOR_TZ)
 )
 
+log_file <- file.path(
+  LOG_DIR,
+  sprintf(
+    "nmemc_surfacewater_%s.log",
+    format(Sys.time(), "%Y%m%d", tz = COLLECTOR_TZ)
+  )
+)
+
 log_msg <- function(...) {
   msg <- paste0(...)
   line <- sprintf(
-  "%s | %s",
-  format(Sys.time(), "%Y-%m-%d %H:%M:%S", tz = COLLECTOR_TZ),
-  msg
-)
+    "%s | %s",
+    format(
+      Sys.time(),
+      "%Y-%m-%d %H:%M:%S",
+      tz = COLLECTOR_TZ
+    ),
+    msg
+  )
+
   cat(line, "\n")
   cat(line, "\n", file = log_file, append = TRUE)
 }
-
 # -----------------------------
 # 2. Package checks
 # -----------------------------
