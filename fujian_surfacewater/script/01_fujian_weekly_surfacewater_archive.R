@@ -48,10 +48,23 @@
 options(stringsAsFactors = FALSE)
 
 # ---- Configuration ---------------------------------------------------------
+TELITI_DATA_ROOT <- Sys.getenv(
+  "TELITI_DATA_ROOT",
+  unset = "D:/# R Project/penelitian"
+)
+
 BASE_DIR <- Sys.getenv(
   "FUJIAN_WATER_BASE_DIR",
-  unset = "D:/# R Project/penelitian/fujian_surfacewater"
+  unset = ""
 )
+
+if (!nzchar(BASE_DIR)) {
+  BASE_DIR <- file.path(
+    TELITI_DATA_ROOT,
+    "fujian_surfacewater"
+  )
+}
+
 SOURCE_URL <- "https://sthjt.fujian.gov.cn/wsbs/bmfwcx/szcx/"
 FIRST_YEAR <- 2004L
 CURRENT_YEAR <- as.integer(format(Sys.Date(), "%Y"))

@@ -24,7 +24,16 @@ options(stringsAsFactors = FALSE, timeout = 120)
 # -----------------------------
 # 1. Configuration
 # -----------------------------
-BASE_DIR <- "D:/# R Project/penelitian/nmemc"
+TELITI_DATA_ROOT <- Sys.getenv(
+  "TELITI_DATA_ROOT",
+  unset = "D:/# R Project/penelitian"
+)
+
+BASE_DIR <- file.path(
+  TELITI_DATA_ROOT,
+  "nmemc"
+)
+
 BASE_URL <- "https://ep.nmemc.org.cn:8888/Water"
 FIRST_YEAR <- 2017L
 

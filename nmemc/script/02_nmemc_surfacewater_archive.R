@@ -48,7 +48,16 @@ options(stringsAsFactors = FALSE, timeout = 120, httr2_progress = FALSE)
 # -----------------------------
 # 1. Configuration
 # -----------------------------
-BASE_DIR <- "D:/# R Project/penelitian/nmemc"
+TELITI_DATA_ROOT <- Sys.getenv(
+  "TELITI_DATA_ROOT",
+  unset = "D:/# R Project/penelitian"
+)
+
+BASE_DIR <- file.path(
+  TELITI_DATA_ROOT,
+  "nmemc"
+)
+
 MAIN_URL <- "https://szzdjc.cnemc.cn:8070/GJZ/Business/Publish/Main.html"
 ENDPOINT <- "https://szzdjc.cnemc.cn:8070/GJZ/Ajax/Publish.ashx"
 ORIGIN   <- "https://szzdjc.cnemc.cn:8070"

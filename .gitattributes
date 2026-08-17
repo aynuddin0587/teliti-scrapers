@@ -1,0 +1,14 @@
+# Normalize text files in the repository
+* text=auto
+
+# Cross-platform source files use Unix LF endings
+*.R text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.gitignore text eol=lf
+*.gitattributes text eol=lf
+
+# Windows command files remain Windows-style
+*.cmd text eol=crlf
+*.bat text eol=crlf

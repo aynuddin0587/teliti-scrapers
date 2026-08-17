@@ -28,7 +28,16 @@ suppressPackageStartupMessages({
 # 1. USER CONFIGURATION
 # =============================================================================
 
-PROJECT_DIR <- "D:/# R Project/penelitian/onlimo"
+TELITI_DATA_ROOT <- Sys.getenv(
+  "TELITI_DATA_ROOT",
+  unset = "D:/# R Project/penelitian"
+)
+
+PROJECT_DIR <- file.path(
+  TELITI_DATA_ROOT,
+  "onlimo"
+)
+
 DATA_DIR    <- file.path(PROJECT_DIR, "data")
 LOG_DIR     <- file.path(PROJECT_DIR, "log")
 
