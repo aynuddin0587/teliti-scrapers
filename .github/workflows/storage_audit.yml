@@ -1,0 +1,74 @@
+name: Teliti Backup Storage Audit
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "34 4 * * 1"
+      timezone: "Asia/Taipei"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: teliti-backup-storage-audit
+  cancel-in-progress: false
+
+jobs:
+  audit-storage:
+    runs-on: ubuntu-24.04
+
+    env:
+      TZ: Asia/Taipei
+      TELITI_TIMEZONE: Asia/Taipei
+      TELITI_BACKUP_REPO: ${{ github.workspace }}/teliti-data-backup
+
+    steps:
+      - name: Check out scraper repository
+        uses: actions/checkout@v7
+
+      - name: Check out full private backup history
+        uses: actions/checkout@v7
+        with:
+          repository: aynuddin0587/teliti-data-backup
+          ref: main
+          path: teliti-data-backup
+          ssh-key: ${{ secrets.TELITI_DATA_DEPLOY_KEY }}
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.6.1"
+          use-public-rspm: true
+
+      - name: Run storage audit
+        run: |
+          Rscript .github/scripts/audit_backup_storage.R
+
+      - name: Show storage audit summary
+        run: |
+          cat teliti-data-backup/system/storage/storage_audit_summary.md
+
+      - name: Show storage audit repository changes
+        working-directory: teliti-data-backup
+        run: |
+          git status --short system/storage/
+
+      - name: Commit and push storage audit safely
+        run: |
+          bash .github/scripts/push_backup_with_retry.sh \
+            "${TELITI_BACKUP_REPO}" \
+            "system/storage/" \
+            "Update Teliti backup storage audit"
+
+      - name: Upload storage audit artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: teliti-storage-audit-${{ github.run_id }}
+          path: |
+            teliti-data-backup/system/storage/storage_audit_current.csv
+            teliti-data-backup/system/storage/storage_audit_summary.md
+          if-no-files-found: error
+          retention-days: 14
