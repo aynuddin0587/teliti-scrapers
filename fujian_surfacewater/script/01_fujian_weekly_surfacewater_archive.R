@@ -1813,7 +1813,48 @@ tryCatch({
   session$Page$addScriptToEvaluateOnNewDocument(source = LOGGER_JS)
 
   log_msg("Opening official Fujian weekly-report page and discovering its data request")
-  session$go_to(SOURCE_URL)
+
+  # Chromote's go_to() normally waits for Page.loadEventFired. On the Fujian
+  # government page, that event can remain pending on a headless CI runner even
+  # after the document and the weekly-data XHR are usable. The XHR is the real
+  # readiness signal for this scraper, so treat only a load-event timeout as
+  # recoverable and continue to inspect the injected network log.
+  page_load_error <- tryCatch({
+    session$go_to(SOURCE_URL, timeout_ = 45)
+    NULL
+  }, error = function(e) e)
+
+  if (!is.null(page_load_error)) {
+    page_load_message <- conditionMessage(page_load_error)
+    is_load_event_timeout <-
+      grepl("timed out", page_load_message, fixed = TRUE) &&
+      grepl("Page.loadEventFired", page_load_message, fixed = TRUE)
+
+    if (!is_load_event_timeout) {
+      stop(page_load_error)
+    }
+
+    page_ready_state <- tryCatch(
+      eval_js(session, "document.readyState"),
+      error = function(e) NA_character_
+    )
+    page_location <- tryCatch(
+      eval_js(session, "location.href"),
+      error = function(e) NA_character_
+    )
+    captured_requests <- tryCatch(
+      netlog_count(session),
+      error = function(e) NA_integer_
+    )
+
+    log_msg(
+      "WARNING: Page.loadEventFired was not observed within 45 seconds; ",
+      "continuing with weekly-data XHR discovery. readyState=",
+      page_ready_state %||% NA_character_,
+      "; location=", page_location %||% NA_character_,
+      "; captured_requests=", captured_requests %||% NA_integer_
+    )
+  }
 
   first_hit <- wait_for_candidate_after(session, after_index = 0L)
   if (is.null(first_hit)) {
