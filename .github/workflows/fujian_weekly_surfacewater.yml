@@ -39,7 +39,7 @@ jobs:
           path: teliti-data-backup
           ssh-key: ${{ secrets.TELITI_DATA_DEPLOY_KEY }}
           persist-credentials: true
-          fetch-depth: 1
+          fetch-depth: 20
 
       - name: Restore Fujian persistent state
         run: |
@@ -112,32 +112,20 @@ jobs:
           echo "Candidate Fujian backup changes:"
           git status --short
 
-      - name: Commit and push Fujian backup
+      - name: Commit and push Fujian backup safely
         if: ${{ always() && steps.package.outcome == 'success' }}
-        working-directory: teliti-data-backup
         run: |
-          git config user.name "teliti-github-actions"
-          git config user.email "teliti-github-actions@users.noreply.github.com"
-
-          git add fujian_weekly_surfacewater/
-
-          if git diff --cached --quiet; then
-            echo "Fujian source state and snapshots are unchanged."
-            echo "Nothing to commit."
-          else
-            echo "Files to be committed:"
-            git diff --cached --name-status
-
-            git commit -m "Update Fujian weekly surface-water backup"
-            git push origin main
-          fi
+          bash .github/scripts/push_backup_with_retry.sh \
+            "${TELITI_BACKUP_REPO}" \
+            "fujian_weekly_surfacewater/" \
+            "Update Fujian weekly surface-water backup"
 
       - name: Show final Fujian backup status
         if: ${{ always() && steps.package.outcome == 'success' }}
         working-directory: teliti-data-backup
         run: |
           git status
-          git log --oneline -3
+          git log --oneline -5
 
       - name: Upload Fujian diagnostics if workflow fails
         if: failure()

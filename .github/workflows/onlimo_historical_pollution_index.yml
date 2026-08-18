@@ -1,4 +1,4 @@
-name: ONLIMO Historical Pollution Index - Backfill Test
+name: ONLIMO Historical Pollution Index Backfill
 
 on:
   workflow_dispatch:
@@ -39,6 +39,7 @@ jobs:
       TELITI_COLLECTOR_ID: github_actions
       TELITI_DATA_ROOT: ${{ github.workspace }}/run-data
       TELITI_BACKUP_REPO: ${{ github.workspace }}/teliti-data-backup
+
       ONLIMO_IP_PARTITION_MODE: "true"
       ONLIMO_IP_SCOPE_MODE: selected_das
       ONLIMO_IP_START_DATE: ${{ inputs.start_date }}
@@ -93,58 +94,13 @@ jobs:
           echo "Candidate ONLIMO historical backup changes:"
           git status --short
 
-      - name: Commit and push historical Pollution Index progress
+      - name: Commit and push historical Pollution Index safely
         if: ${{ always() && steps.package.outcome == 'success' }}
-        working-directory: teliti-data-backup
         run: |
-          git config user.name "teliti-github-actions"
-          git config user.email "teliti-github-actions@users.noreply.github.com"
-
-          git add onlimo_pollution_index/
-
-          if git diff --cached --quiet; then
-            echo "Historical Pollution Index state is unchanged."
-            echo "Nothing to commit."
-            exit 0
-          fi
-
-          echo "Files to be committed:"
-          git diff --cached --name-status
-
-          git commit -m "Update ONLIMO historical Pollution Index backfill"
-
-          echo ""
-          echo "Synchronizing with latest teliti-data-backup/main before push."
-
-          for attempt in 1 2 3 4 5
-          do
-            echo ""
-            echo "Push attempt ${attempt}/5"
-
-            git fetch origin main
-
-            if ! git rebase origin/main
-            then
-              echo "ERROR: Rebase conflict detected."
-              git status
-              git rebase --abort || true
-              exit 1
-            fi
-
-            if git push origin main
-            then
-              echo "Backup push succeeded."
-              exit 0
-            fi
-
-            echo "Remote changed again before push."
-            echo "Will fetch, rebase, and retry."
-
-            sleep $((attempt * 5))
-          done
-
-          echo "ERROR: Could not push backup after 5 attempts."
-          exit 1
+          bash .github/scripts/push_backup_with_retry.sh \
+            "${TELITI_BACKUP_REPO}" \
+            "onlimo_pollution_index/" \
+            "Update ONLIMO historical Pollution Index backfill"
 
       - name: Show final historical backup status
         if: ${{ always() && steps.package.outcome == 'success' }}
