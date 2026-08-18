@@ -1,0 +1,149 @@
+name: Fujian Weekly Surface Water - Persistent Backup Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fujian-weekly-surfacewater-backup
+  cancel-in-progress: false
+
+jobs:
+  backup-fujian-weekly:
+    runs-on: ubuntu-24.04
+
+    env:
+      TZ: Asia/Taipei
+      TELITI_TIMEZONE: Asia/Taipei
+      TELITI_COLLECTOR_ID: github_actions
+      TELITI_DATA_ROOT: ${{ github.workspace }}/run-data
+      TELITI_BACKUP_REPO: ${{ github.workspace }}/teliti-data-backup
+      FUJIAN_WATER_MODE: auto
+      CHROMOTE_HEADLESS: new
+
+    steps:
+      - name: Check out scraper repository
+        uses: actions/checkout@v7
+
+      - name: Check out private data backup repository
+        uses: actions/checkout@v7
+        with:
+          repository: aynuddin0587/teliti-data-backup
+          ref: main
+          path: teliti-data-backup
+          ssh-key: ${{ secrets.TELITI_DATA_DEPLOY_KEY }}
+          persist-credentials: true
+          fetch-depth: 1
+
+      - name: Restore Fujian persistent state
+        run: |
+          mkdir -p run-data/fujian_surfacewater/data/source
+
+          if [ -d teliti-data-backup/fujian_weekly_surfacewater/state/source ]; then
+            cp -a \
+              teliti-data-backup/fujian_weekly_surfacewater/state/source/. \
+              run-data/fujian_surfacewater/data/source/
+
+            echo "Restored Fujian canonical year state."
+          else
+            echo "No persistent Fujian canonical state exists yet."
+            echo "The first GitHub run will perform the historical backfill."
+          fi
+
+          if [ -d teliti-data-backup/fujian_weekly_surfacewater/state/checkpoints ]; then
+            mkdir -p run-data/fujian_surfacewater/data/source/.checkpoints
+
+            cp -a \
+              teliti-data-backup/fujian_weekly_surfacewater/state/checkpoints/. \
+              run-data/fujian_surfacewater/data/source/.checkpoints/
+
+            echo "Restored Fujian interrupted-backfill checkpoints."
+          else
+            echo "No Fujian backfill checkpoints need restoration."
+          fi
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.6.1"
+          use-public-rspm: true
+
+      - name: Restore R environment
+        uses: r-lib/actions/setup-renv@v2
+
+      - name: Verify Chrome and Chromote
+        run: |
+          CHROME_PATH="$(command -v google-chrome || command -v chromium || true)"
+
+          if [ -z "$CHROME_PATH" ]; then
+            echo "No Google Chrome or Chromium executable was found."
+            exit 1
+          fi
+
+          export CHROMOTE_CHROME="$CHROME_PATH"
+          echo "CHROMOTE_CHROME=$CHROME_PATH" >> "$GITHUB_ENV"
+
+          echo "Chrome executable: $CHROME_PATH"
+          "$CHROME_PATH" --version
+
+          Rscript -e "cat('chromote::find_chrome():', chromote::find_chrome(), '\n'); b <- chromote::ChromoteSession\$new(); v <- b\$Browser\$getVersion(); cat('Chromote browser product:', v\$product, '\n'); b\$close()"
+
+      - name: Run Fujian weekly surface-water scraper
+        timeout-minutes: 240
+        run: |
+          Rscript fujian_surfacewater/script/01_fujian_weekly_surfacewater_archive.R auto
+
+      - name: Prepare persistent Fujian backup
+        id: package
+        if: always()
+        run: |
+          Rscript .github/scripts/prepare_fujian_weekly_backup.R
+
+      - name: Show Fujian backup repository changes
+        if: ${{ always() && steps.package.outcome == 'success' }}
+        working-directory: teliti-data-backup
+        run: |
+          echo "Candidate Fujian backup changes:"
+          git status --short
+
+      - name: Commit and push Fujian backup
+        if: ${{ always() && steps.package.outcome == 'success' }}
+        working-directory: teliti-data-backup
+        run: |
+          git config user.name "teliti-github-actions"
+          git config user.email "teliti-github-actions@users.noreply.github.com"
+
+          git add fujian_weekly_surfacewater/
+
+          if git diff --cached --quiet; then
+            echo "Fujian source state and snapshots are unchanged."
+            echo "Nothing to commit."
+          else
+            echo "Files to be committed:"
+            git diff --cached --name-status
+
+            git commit -m "Update Fujian weekly surface-water backup"
+            git push origin main
+          fi
+
+      - name: Show final Fujian backup status
+        if: ${{ always() && steps.package.outcome == 'success' }}
+        working-directory: teliti-data-backup
+        run: |
+          git status
+          git log --oneline -3
+
+      - name: Upload Fujian diagnostics if workflow fails
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fujian-weekly-failure-${{ github.run_id }}
+          path: |
+            run-data/fujian_surfacewater/log/
+            run-data/fujian_surfacewater/data/source/diagnostics/
+            run-data/fujian_surfacewater/data/source/.checkpoints/
+            run-data/fujian_surfacewater/data/source/fujian_weekly_backend_discovery.rds
+          if-no-files-found: warn
+          retention-days: 7

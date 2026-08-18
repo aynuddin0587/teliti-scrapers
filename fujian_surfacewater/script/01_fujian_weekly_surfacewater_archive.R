@@ -65,9 +65,23 @@ if (!nzchar(BASE_DIR)) {
   )
 }
 
+COLLECTOR_TZ <- Sys.getenv(
+  "TELITI_TIMEZONE",
+  unset = "Asia/Taipei"
+)
+
+COLLECTOR_ID <- Sys.getenv(
+  "TELITI_COLLECTOR_ID",
+  unset = "local_pc"
+)
+
+GITHUB_RUN_ID <- Sys.getenv("GITHUB_RUN_ID", unset = "")
+GITHUB_RUN_ATTEMPT <- Sys.getenv("GITHUB_RUN_ATTEMPT", unset = "")
+GITHUB_SHA <- Sys.getenv("GITHUB_SHA", unset = "")
+
 SOURCE_URL <- "https://sthjt.fujian.gov.cn/wsbs/bmfwcx/szcx/"
 FIRST_YEAR <- 2004L
-CURRENT_YEAR <- as.integer(format(Sys.Date(), "%Y"))
+CURRENT_YEAR <- as.integer(format(Sys.time(), "%Y", tz = COLLECTOR_TZ))
 WAIT_TIMEOUT_SEC <- 75
 PAGE_DELAY_SEC <- 0.40
 MAX_PAGE_RETRIES <- 6L
@@ -109,12 +123,20 @@ if (length(missing_packages) > 0) {
 # ---- Logging ---------------------------------------------------------------
 log_file <- file.path(
   LOG_DIR,
-  paste0("fujian_weekly_surfacewater_", format(Sys.Date(), "%Y%m%d"), ".log")
+  paste0(
+    "fujian_weekly_surfacewater_",
+    format(Sys.time(), "%Y%m%d", tz = COLLECTOR_TZ),
+    ".log"
+  )
 )
 
 log_msg <- function(...) {
   msg <- paste0(...)
-  line <- paste0(format(Sys.time(), "%Y-%m-%d %H:%M:%S"), " | ", msg)
+  line <- paste0(
+    format(Sys.time(), "%Y-%m-%d %H:%M:%S", tz = COLLECTOR_TZ),
+    " | ",
+    msg
+  )
   cat(line, "\n")
   cat(line, "\n", file = log_file, append = TRUE)
 }
@@ -753,7 +775,7 @@ sanitize_file_component <- function(x) {
 }
 
 write_unexpected_response <- function(text, label, page, attempt, error_message = NULL) {
-  stamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+  stamp <- format(Sys.time(), "%Y%m%d_%H%M%S", tz = COLLECTOR_TZ)
   fn <- file.path(
     DIAGNOSTIC_DIR,
     sprintf(
@@ -867,7 +889,7 @@ fetch_all_pages <- function(session, first_hit, page_spec, label = "dataset", ch
         label = label,
         total_pages = as.integer(total_pages),
         total_count = as.integer(total_count),
-        updated_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S %z")
+        updated_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S %z", tz = COLLECTOR_TZ)
       ),
       manifest_file,
       version = 3
@@ -1391,7 +1413,7 @@ collect_year_by_week <- function(session, base_hit, page_spec, year, use_checkpo
           classsql = part$classsql,
           prepage = part$prepage,
           data = part$data,
-          captured_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S %z")
+          captured_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S %z", tz = COLLECTOR_TZ)
         ),
         cp_file,
         compress = "xz",
@@ -1498,10 +1520,10 @@ archive_year_snapshot <- function(year, raw_df, backend_url, source_mode) {
   }
 
   changed <- !file.exists(canonical) || is.na(old_hash) || !identical(old_hash, hash)
-  checked_at <- format(Sys.time(), "%Y-%m-%d %H:%M:%S %z")
+  checked_at <- format(Sys.time(), "%Y-%m-%d %H:%M:%S %z", tz = COLLECTOR_TZ)
 
   if (changed) {
-    stamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+    stamp <- format(Sys.time(), "%Y%m%d_%H%M%S", tz = COLLECTOR_TZ)
     year_archive_dir <- file.path(ARCHIVE_DIR, as.character(year))
     dir.create(year_archive_dir, recursive = TRUE, showWarnings = FALSE)
     archive_file <- file.path(
@@ -1526,7 +1548,11 @@ archive_year_snapshot <- function(year, raw_df, backend_url, source_mode) {
     rows = as.integer(nrow(raw_df)),
     snapshot_md5 = hash,
     checked_at = checked_at,
-    changed = changed
+    changed = changed,
+    collector_id = COLLECTOR_ID,
+    github_run_id = if (nzchar(GITHUB_RUN_ID)) GITHUB_RUN_ID else NA_character_,
+    github_run_attempt = if (nzchar(GITHUB_RUN_ATTEMPT)) GITHUB_RUN_ATTEMPT else NA_character_,
+    scraper_code_commit = if (nzchar(GITHUB_SHA)) GITHUB_SHA else NA_character_
   )
   saveRDS(meta, meta_file, version = 3)
   invisible(meta)
@@ -1631,7 +1657,11 @@ standardize_year_source <- function(raw_df, year, meta) {
     source_page_number = if ("source_page" %in% names(raw_df)) as.integer(raw_df$source_page) else NA_integer_,
     source_year_file = basename(canonical_source_file(year)),
     source_snapshot_md5 = meta$snapshot_md5,
-    source_checked_at = meta$checked_at
+    source_checked_at = meta$checked_at,
+    collector_id = as.character(meta$collector_id %||% NA_character_),
+    github_run_id = as.character(meta$github_run_id %||% NA_character_),
+    github_run_attempt = as.character(meta$github_run_attempt %||% NA_character_),
+    scraper_code_commit = as.character(meta$scraper_code_commit %||% NA_character_)
   )
 
   out$report_year_week <- ifelse(
@@ -1698,7 +1728,11 @@ rebuild_master <- function() {
       snapshot_md5 = as.character(meta$snapshot_md5 %||% NA_character_),
       checked_at = as.character(meta$checked_at %||% NA_character_),
       backend_url = as.character(meta$backend_url %||% NA_character_),
-      source_mode = as.character(meta$source_mode %||% NA_character_)
+      source_mode = as.character(meta$source_mode %||% NA_character_),
+      collector_id = as.character(meta$collector_id %||% NA_character_),
+      github_run_id = as.character(meta$github_run_id %||% NA_character_),
+      github_run_attempt = as.character(meta$github_run_attempt %||% NA_character_),
+      scraper_code_commit = as.character(meta$scraper_code_commit %||% NA_character_)
     )
   }
 
@@ -1742,6 +1776,13 @@ rebuild_master <- function() {
 log_msg("START Fujian weekly surface-water archive V11")
 log_msg("Source: ", SOURCE_URL)
 log_msg("Mode: ", MODE)
+log_msg("Collector ID: ", COLLECTOR_ID)
+log_msg("Collector timezone: ", COLLECTOR_TZ)
+chrome_path <- tryCatch(chromote::find_chrome(), error = function(e) NULL)
+log_msg(
+  "Chrome executable: ",
+  if (is.null(chrome_path) || length(chrome_path) == 0L) "not found" else as.character(chrome_path[[1]])
+)
 if (NEED_BACKFILL) {
   log_msg("Collection plan: native year-week historical backfill, 2004-", CURRENT_YEAR)
 } else {
@@ -1753,6 +1794,11 @@ run_ok <- FALSE
 
 tryCatch({
   session <- chromote::ChromoteSession$new()
+
+  browser_version <- tryCatch(session$Browser$getVersion(), error = function(e) NULL)
+  if (!is.null(browser_version$product)) {
+    log_msg("Browser product: ", browser_version$product)
+  }
 
   # Use the installed Chrome version's own UA, but remove the Headless token.
   try({
@@ -1813,7 +1859,7 @@ tryCatch({
   }
 
   discovery <- list(
-    discovered_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S %z"),
+    discovered_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S %z", tz = COLLECTOR_TZ),
     source_url = SOURCE_URL,
     first_request = first_hit$entry,
     first_response_count = first_hit$info$count,
@@ -1893,5 +1939,5 @@ tryCatch({
   stop(e)
 }, finally = {
   if (!is.null(session)) try(session$close(), silent = TRUE)
-  if (run_ok) log_msg("END Fujian weekly surface-water archive V9")
+  if (run_ok) log_msg("END Fujian weekly surface-water archive V11")
 })
