@@ -73,3 +73,8 @@
 
 !/onlimo/script/01_onlimo_daily_archive.R
 !/onlimo/script/02_onlimo_historical_pollution_index.R
+
+# Teliti reconciliation code
+!/teliti_reconciliation/
+!/teliti_reconciliation/script/
+!/teliti_reconciliation/script/**
