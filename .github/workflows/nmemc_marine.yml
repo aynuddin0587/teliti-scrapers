@@ -1,7 +1,11 @@
-name: NMEMC Marine Water - Persistent Backup Test
+name: NMEMC Marine Water Backup
 
 on:
   workflow_dispatch:
+
+  schedule:
+    - cron: "37 12 2,17 * *"
+      timezone: "Asia/Taipei"
 
 permissions:
   contents: read
