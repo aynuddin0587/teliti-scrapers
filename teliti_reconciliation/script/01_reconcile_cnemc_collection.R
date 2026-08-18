@@ -290,20 +290,32 @@ gh_end <- max(gh$collected_at_utc)
 
 common_start <- max(pc_start, gh_start)
 common_end <- min(pc_end, gh_end)
+has_strict_common_window <- common_start <= common_end
 
-if (common_start > common_end) {
-  stop(
-    "PC and GitHub CNEMC manifests do not overlap in time. ",
-    "PC: ", format_utc(pc_start), " to ", format_utc(pc_end),
-    "; GitHub: ", format_utc(gh_start), " to ", format_utc(gh_end), "."
-  )
+if (has_strict_common_window) {
+  pc_common <- pc %>%
+    filter(collected_at_utc >= common_start, collected_at_utc <= common_end)
+
+  gh_common <- gh %>%
+    filter(collected_at_utc >= common_start, collected_at_utc <= common_end)
+} else {
+  # A strict overlap is not required for temporal validation. A PC and GitHub
+  # run can still be a valid near-time pair when they straddle the boundary
+  # between the two manifest histories by less than the pairing tolerance.
+  pc_common <- pc[0, , drop = FALSE]
+  gh_common <- gh[0, , drop = FALSE]
 }
 
-pc_common <- pc %>%
-  filter(collected_at_utc >= common_start, collected_at_utc <= common_end)
+pair_tolerance_seconds <- PAIR_TOLERANCE_MINUTES * 60
 
-gh_common <- gh %>%
-  filter(collected_at_utc >= common_start, collected_at_utc <= common_end)
+# For temporal pairing, extend the GitHub observation envelope by the allowed
+# tolerance. This avoids dropping a valid boundary pair such as PC 12:00 and
+# GitHub 12:02 merely because 12:00 is the strict common-window endpoint.
+pc_pair_candidates <- pc %>%
+  filter(
+    collected_at_utc >= gh_start - pair_tolerance_seconds,
+    collected_at_utc <= gh_end + pair_tolerance_seconds
+  )
 
 # -----------------------------------------------------------------------------
 # 5. Reconcile unique source states by snapshot MD5
@@ -364,22 +376,26 @@ state_reconciliation <- full_join(
   )
 
 # -----------------------------------------------------------------------------
-# 6. Pair each PC run to the nearest GitHub run within the common window
+# 6. Pair each eligible PC run to the nearest GitHub run
 # -----------------------------------------------------------------------------
 
-if (nrow(pc_common) > 0L && nrow(gh_common) > 0L) {
+# Exact source-state overlap above deliberately uses the strict common window.
+# Temporal pairing is different: it uses a tolerance-extended boundary so a
+# scientifically useful near-time pair is not discarded solely because one
+# collector ran a few minutes beyond the other collector's latest timestamp.
+if (nrow(pc_pair_candidates) > 0L && nrow(gh) > 0L) {
   nearest_idx <- nearest_right_index(
-    pc_common$collected_at_utc,
-    gh_common$collected_at_utc
+    pc_pair_candidates$collected_at_utc,
+    gh$collected_at_utc
   )
 
-  nearest_gh <- gh_common[nearest_idx, , drop = FALSE]
+  nearest_gh <- gh[nearest_idx, , drop = FALSE]
 
   pairs <- tibble(
-    pc_collected_at_utc = pc_common$collected_at_utc,
-    pc_snapshot_md5 = pc_common$snapshot_md5,
-    pc_rows = pc_common$rows,
-    pc_changed = pc_common$changed,
+    pc_collected_at_utc = pc_pair_candidates$collected_at_utc,
+    pc_snapshot_md5 = pc_pair_candidates$snapshot_md5,
+    pc_rows = pc_pair_candidates$rows,
+    pc_changed = pc_pair_candidates$changed,
     github_collected_at_utc = nearest_gh$collected_at_utc,
     github_snapshot_md5 = nearest_gh$snapshot_md5,
     github_rows = nearest_gh$rows,
@@ -396,6 +412,15 @@ if (nrow(pc_common) > 0L && nrow(gh_common) > 0L) {
       ),
       abs_lag_minutes = abs(lag_minutes),
       within_tolerance = abs_lag_minutes <= PAIR_TOLERANCE_MINUTES,
+      pair_scope = case_when(
+        !within_tolerance ~ "outside_tolerance",
+        has_strict_common_window &
+          pc_collected_at_utc >= common_start &
+          pc_collected_at_utc <= common_end &
+          github_collected_at_utc >= common_start &
+          github_collected_at_utc <= common_end ~ "strict_common_window",
+        TRUE ~ "boundary_tolerance"
+      ),
       exact_snapshot_match = within_tolerance &
         pc_snapshot_md5 == github_snapshot_md5,
       row_count_match = within_tolerance & pc_rows == github_rows
@@ -419,6 +444,16 @@ common_shared_states <- length(intersect(pc_common_hashes, gh_common_hashes))
 common_union_states <- length(union(pc_common_hashes, gh_common_hashes))
 
 paired_within <- if (nrow(pairs) > 0L) sum(pairs$within_tolerance) else 0L
+paired_strict <- if (nrow(pairs) > 0L) {
+  sum(pairs$pair_scope == "strict_common_window")
+} else {
+  0L
+}
+paired_boundary <- if (nrow(pairs) > 0L) {
+  sum(pairs$pair_scope == "boundary_tolerance")
+} else {
+  0L
+}
 paired_exact <- if (nrow(pairs) > 0L) sum(pairs$exact_snapshot_match) else 0L
 paired_rows_equal <- if (nrow(pairs) > 0L) {
   sum(pairs$within_tolerance & pairs$row_count_match)
@@ -453,8 +488,18 @@ summary_table <- bind_rows(
   write_metric("pc_end", format_utc(pc_end)),
   write_metric("github_start", format_utc(gh_start)),
   write_metric("github_end", format_utc(gh_end)),
-  write_metric("common_window_start", format_utc(common_start)),
-  write_metric("common_window_end", format_utc(common_end)),
+  write_metric(
+    "strict_common_window_exists",
+    has_strict_common_window
+  ),
+  write_metric(
+    "common_window_start",
+    if (has_strict_common_window) format_utc(common_start) else NA_character_
+  ),
+  write_metric(
+    "common_window_end",
+    if (has_strict_common_window) format_utc(common_end) else NA_character_
+  ),
 
   write_metric("pc_unique_source_states", all_pc_states, "all_time"),
   write_metric("github_unique_source_states", all_gh_states, "all_time"),
@@ -512,9 +557,26 @@ summary_table <- bind_rows(
   ),
 
   write_metric(
+    "pc_pair_candidates",
+    nrow(pc_pair_candidates),
+    "temporal_pairing",
+    "PC runs inside the GitHub history extended by the pairing tolerance."
+  ),
+  write_metric(
     "pc_runs_paired_within_tolerance",
     paired_within,
     "temporal_pairing"
+  ),
+  write_metric(
+    "strict_common_window_pairs",
+    paired_strict,
+    "temporal_pairing"
+  ),
+  write_metric(
+    "boundary_tolerance_pairs",
+    paired_boundary,
+    "temporal_pairing",
+    "Valid near-time pairs that straddle a strict manifest-history boundary."
   ),
   write_metric(
     "pair_tolerance_minutes",
@@ -580,8 +642,15 @@ md_lines <- c(
   "",
   "## Common operating window",
   "",
-  paste0("- Start: ", format_utc(common_start)),
-  paste0("- End: ", format_utc(common_end)),
+  paste0("- Strict overlap exists: ", has_strict_common_window),
+  paste0(
+    "- Start: ",
+    if (has_strict_common_window) format_utc(common_start) else "none"
+  ),
+  paste0(
+    "- End: ",
+    if (has_strict_common_window) format_utc(common_end) else "none"
+  ),
   "",
   "## Exact source-state overlap",
   "",
@@ -608,8 +677,17 @@ md_lines <- c(
   "",
   "## Nearest-in-time pairing",
   "",
+  paste0(
+    "Temporal pairing uses the ±", PAIR_TOLERANCE_MINUTES,
+    " minute tolerance across strict history boundaries; it is not limited ",
+    "to runs lying entirely inside the strict common window."
+  ),
+  "",
   paste0("- Pair tolerance: ±", PAIR_TOLERANCE_MINUTES, " minutes"),
+  paste0("- Eligible PC runs considered: ", nrow(pc_pair_candidates)),
   paste0("- PC runs with a GitHub run within tolerance: ", paired_within),
+  paste0("- Pairs fully inside strict common window: ", paired_strict),
+  paste0("- Boundary-tolerance pairs: ", paired_boundary),
   paste0("- Median absolute time lag: ", round(median_abs_lag, 2), " minutes"),
   paste0("- Exact snapshot matches among temporal pairs: ", paired_exact),
   paste0(
@@ -650,7 +728,15 @@ writeLines(md_lines, SUMMARY_MD, useBytes = TRUE)
 # -----------------------------------------------------------------------------
 
 cat("\nCNEMC collection-level reconciliation complete.\n")
-cat("Common window: ", format_utc(common_start), " -> ", format_utc(common_end), "\n", sep = "")
+if (has_strict_common_window) {
+  cat(
+    "Strict common window: ",
+    format_utc(common_start), " -> ", format_utc(common_end), "\n",
+    sep = ""
+  )
+} else {
+  cat("Strict common window: none\n")
+}
 cat("PC unique source states in common window: ", common_pc_states, "\n", sep = "")
 cat("GitHub unique source states in common window: ", common_gh_states, "\n", sep = "")
 cat("Confirmed exact source states: ", common_shared_states, "\n", sep = "")
@@ -661,6 +747,8 @@ cat(
   sep = ""
 )
 cat("PC runs paired within ±", PAIR_TOLERANCE_MINUTES, " min: ", paired_within, "\n", sep = "")
+cat("  Strict-window pairs: ", paired_strict, "\n", sep = "")
+cat("  Boundary-tolerance pairs: ", paired_boundary, "\n", sep = "")
 cat("Exact snapshot matches among temporal pairs: ", paired_exact, "\n", sep = "")
 cat("Equal row counts among temporal pairs: ", paired_rows_equal, "\n", sep = "")
 cat("\nOutputs:\n")
