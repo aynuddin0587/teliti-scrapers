@@ -1,0 +1,131 @@
+name: ONLIMO Historical Pollution Index - Backfill Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Historical start date (YYYY-MM-DD)"
+        required: true
+        default: "2024-07-01"
+        type: string
+      end_date:
+        description: "Historical end date (YYYY-MM-DD or yesterday)"
+        required: true
+        default: "2024-09-30"
+        type: string
+      max_requests:
+        description: "Maximum station-block requests for this run"
+        required: true
+        default: "300"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: onlimo-historical-pollution-index-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill-onlimo-pollution-index:
+    runs-on: ubuntu-24.04
+
+    env:
+      TZ: Asia/Taipei
+      TELITI_TIMEZONE: Asia/Taipei
+      TELITI_COLLECTOR_ID: github_actions
+      TELITI_DATA_ROOT: ${{ github.workspace }}/run-data
+      TELITI_BACKUP_REPO: ${{ github.workspace }}/teliti-data-backup
+      ONLIMO_IP_PARTITION_MODE: "true"
+      ONLIMO_IP_SCOPE_MODE: selected_das
+      ONLIMO_IP_START_DATE: ${{ inputs.start_date }}
+      ONLIMO_IP_END_DATE: ${{ inputs.end_date }}
+      ONLIMO_IP_MAX_REQUESTS_PER_RUN: ${{ inputs.max_requests }}
+      ONLIMO_IP_CHECKPOINT_EVERY: "25"
+      ONLIMO_IP_REFRESH_COMPLETED: "false"
+
+    steps:
+      - name: Check out scraper repository
+        uses: actions/checkout@v7
+
+      - name: Check out private data backup repository
+        uses: actions/checkout@v7
+        with:
+          repository: aynuddin0587/teliti-data-backup
+          ref: main
+          path: teliti-data-backup
+          ssh-key: ${{ secrets.TELITI_DATA_DEPLOY_KEY }}
+          persist-credentials: true
+          fetch-depth: 1
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.6.1"
+          use-public-rspm: true
+
+      - name: Restore R environment
+        uses: r-lib/actions/setup-renv@v2
+
+      - name: Restore historical worker state and station catalogue
+        run: |
+          Rscript .github/scripts/restore_onlimo_historical_state.R
+
+      - name: Run ONLIMO historical Pollution Index worker
+        id: scrape
+        timeout-minutes: 120
+        run: |
+          Rscript onlimo/script/02_onlimo_historical_pollution_index.R
+
+      - name: Prepare persistent historical Pollution Index backup
+        id: package
+        if: always()
+        run: |
+          Rscript .github/scripts/prepare_onlimo_historical_backup.R
+
+      - name: Show historical backup repository changes
+        if: ${{ always() && steps.package.outcome == 'success' }}
+        working-directory: teliti-data-backup
+        run: |
+          echo "Candidate ONLIMO historical backup changes:"
+          git status --short
+
+      - name: Commit and push historical Pollution Index progress
+        if: ${{ always() && steps.package.outcome == 'success' }}
+        working-directory: teliti-data-backup
+        run: |
+          git config user.name "teliti-github-actions"
+          git config user.email "teliti-github-actions@users.noreply.github.com"
+
+          git add onlimo_pollution_index/
+
+          if git diff --cached --quiet; then
+            echo "Historical Pollution Index state is unchanged."
+            echo "Nothing to commit."
+          else
+            echo "Files to be committed:"
+            git diff --cached --name-status
+
+            git commit -m "Update ONLIMO historical Pollution Index backfill"
+            git push origin main
+          fi
+
+      - name: Show final historical backup status
+        if: ${{ always() && steps.package.outcome == 'success' }}
+        working-directory: teliti-data-backup
+        run: |
+          git status
+          git log --oneline -3
+
+      - name: Upload historical diagnostics if workflow fails
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: onlimo-historical-ip-failure-${{ github.run_id }}
+          path: |
+            run-data/onlimo/log/
+            run-data/onlimo/data/onlimo_pollution_index_request_ledger.csv
+            run-data/onlimo/data/onlimo_pollution_index_run_rows.csv.gz
+            run-data/onlimo/data/onlimo_pollution_index_run_summary.csv
+          if-no-files-found: warn
+          retention-days: 7

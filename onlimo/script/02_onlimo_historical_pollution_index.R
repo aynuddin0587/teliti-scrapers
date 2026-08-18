@@ -33,13 +33,30 @@ TELITI_DATA_ROOT <- Sys.getenv(
   unset = "D:/# R Project/penelitian"
 )
 
-PROJECT_DIR <- file.path(
-  TELITI_DATA_ROOT,
-  "onlimo"
-)
-
+PROJECT_DIR <- file.path(TELITI_DATA_ROOT, "onlimo")
 DATA_DIR    <- file.path(PROJECT_DIR, "data")
 LOG_DIR     <- file.path(PROJECT_DIR, "log")
+
+COLLECTOR_TZ <- Sys.getenv(
+  "TELITI_TIMEZONE",
+  unset = "Asia/Taipei"
+)
+
+COLLECTOR_ID <- Sys.getenv(
+  "TELITI_COLLECTOR_ID",
+  unset = "local_pc"
+)
+
+GITHUB_RUN_ID <- Sys.getenv("GITHUB_RUN_ID", unset = "")
+GITHUB_RUN_ATTEMPT <- Sys.getenv("GITHUB_RUN_ATTEMPT", unset = "")
+GITHUB_SHA <- Sys.getenv("GITHUB_SHA", unset = "")
+
+PARTITION_MODE <- tolower(
+  Sys.getenv(
+    "ONLIMO_IP_PARTITION_MODE",
+    unset = if (identical(COLLECTOR_ID, "github_actions")) "true" else "false"
+  )
+) %in% c("1", "true", "yes", "y")
 
 BASE_PAGE <- "https://onlimo.kemenlh.go.id/app/"
 BASE_API  <- "https://onlimo.kemenlh.go.id/app/index"
@@ -50,11 +67,19 @@ LEDGER_FILE <- file.path(DATA_DIR, "onlimo_pollution_index_request_ledger.csv")
 COVERAGE_FILE <- file.path(DATA_DIR, "onlimo_pollution_index_coverage_station.csv")
 MONTHLY_FILE <- file.path(DATA_DIR, "onlimo_pollution_index_summary_monthly.csv")
 
+# Cloud-friendly per-run products. These are deliberately separate from the
+# cumulative Windows archive so GitHub can use append-oriented storage.
+RUN_ROWS_FILE <- file.path(DATA_DIR, "onlimo_pollution_index_run_rows.csv.gz")
+RUN_SUMMARY_FILE <- file.path(DATA_DIR, "onlimo_pollution_index_run_summary.csv")
+
 # Scope options:
 #   "selected_das"      = all stations in SELECTED_DAS
 #   "all_catalog"       = every station in the current station catalogue
 #   "explicit_stations" = only station IDs listed in EXPLICIT_STATIONS
-SCOPE_MODE <- "selected_das"
+SCOPE_MODE <- Sys.getenv(
+  "ONLIMO_IP_SCOPE_MODE",
+  unset = "selected_das"
+)
 
 SELECTED_DAS <- c(
   "Ciliwung",
@@ -80,8 +105,39 @@ STATION_CATEGORY_FILTER <- NULL
 # Empty periods are legitimate and are recorded in the request ledger.
 # START_DATE <- as.Date("2020-01-01")
 # END_DATE   <- Sys.Date() - 1L
-START_DATE <- as.Date("2024-07-01")
-END_DATE   <- as.Date("2024-09-30")
+parse_config_date <- function(name, default_value) {
+  value <- Sys.getenv(name, unset = "")
+
+  if (!nzchar(value)) {
+    return(as.Date(default_value))
+  }
+
+  if (tolower(value) == "yesterday") {
+    return(Sys.Date() - 1L)
+  }
+
+  out <- suppressWarnings(as.Date(value))
+
+  if (is.na(out)) {
+    stop(
+      name,
+      " must be YYYY-MM-DD or 'yesterday'. Received: ",
+      value
+    )
+  }
+
+  out
+}
+
+START_DATE <- parse_config_date(
+  "ONLIMO_IP_START_DATE",
+  "2024-07-01"
+)
+
+END_DATE <- parse_config_date(
+  "ONLIMO_IP_END_DATE",
+  "2024-09-30"
+)
 
 
 # trendWeekChart has been verified with 7-day windows, so keep this conservative.
@@ -94,14 +150,41 @@ REQUEST_PAUSE_MAX_SEC <- 1.1
 # Safety cap per execution. Because the request ledger is resumable, re-running
 # the script continues where it stopped. Set to Inf after you are comfortable
 # with the workflow and want a single long run.
-MAX_REQUESTS_PER_RUN <- 3000L
+MAX_REQUESTS_PER_RUN <- suppressWarnings(
+  as.numeric(
+    Sys.getenv(
+      "ONLIMO_IP_MAX_REQUESTS_PER_RUN",
+      unset = "3000"
+    )
+  )
+)
 
-# Save archive + ledger after this many requests.
-CHECKPOINT_EVERY <- 50L
+if (is.na(MAX_REQUESTS_PER_RUN) || MAX_REQUESTS_PER_RUN <= 0) {
+  stop("ONLIMO_IP_MAX_REQUESTS_PER_RUN must be a positive number.")
+}
+
+# Save data + ledger after this many requests.
+CHECKPOINT_EVERY <- suppressWarnings(
+  as.integer(
+    Sys.getenv(
+      "ONLIMO_IP_CHECKPOINT_EVERY",
+      unset = "50"
+    )
+  )
+)
+
+if (is.na(CHECKPOINT_EVERY) || CHECKPOINT_EVERY <= 0L) {
+  stop("ONLIMO_IP_CHECKPOINT_EVERY must be a positive integer.")
+}
 
 # If FALSE, station/block requests already recorded as successful or genuinely
 # empty are skipped. Normally leave this FALSE.
-REFRESH_COMPLETED_BLOCKS <- FALSE
+REFRESH_COMPLETED_BLOCKS <- tolower(
+  Sys.getenv(
+    "ONLIMO_IP_REFRESH_COMPLETED",
+    unset = "false"
+  )
+) %in% c("1", "true", "yes", "y")
 
 # =============================================================================
 # 2. SETUP AND LOGGING
@@ -113,19 +196,39 @@ dir.create(LOG_DIR, recursive = TRUE, showWarnings = FALSE)
 run_started <- Sys.time()
 log_file <- file.path(
   LOG_DIR,
-  paste0("historical_ip_", format(run_started, "%Y%m%d_%H%M%S"), ".log")
+  paste0(
+    "historical_ip_",
+    format(run_started, "%Y%m%d_%H%M%S", tz = COLLECTOR_TZ),
+    ".log"
+  )
 )
 
 log_msg <- function(...) {
   msg <- paste0(..., collapse = "")
-  line <- paste0(format(Sys.time(), "%Y-%m-%d %H:%M:%S"), " | ", msg)
+  line <- paste0(
+    format(Sys.time(), "%Y-%m-%d %H:%M:%S", tz = COLLECTOR_TZ),
+    " | ",
+    msg
+  )
   cat(line, "\n")
   cat(line, "\n", file = log_file, append = TRUE)
 }
 
 retrieved_at_now <- function() {
-  format(Sys.time(), "%Y-%m-%d %H:%M:%S%z")
+  format(
+    Sys.time(),
+    "%Y-%m-%d %H:%M:%S%z",
+    tz = COLLECTOR_TZ
+  )
 }
+
+optional_env_value <- function(x) {
+  if (nzchar(x)) x else NA_character_
+}
+
+# Per-run outputs must never inherit stale content from a previous local run.
+unlink(RUN_ROWS_FILE, force = TRUE)
+unlink(RUN_SUMMARY_FILE, force = TRUE)
 
 safe_text <- function(x) {
   if (length(x) == 0 || is.null(x) || is.na(x)) return(NA_character_)
@@ -193,8 +296,12 @@ if (nrow(selected_catalog) == 0) {
 
 log_msg("START historical Pollution Index extraction")
 log_msg("Scope mode: ", SCOPE_MODE)
+log_msg("Collector ID: ", COLLECTOR_ID)
+log_msg("Collector timezone: ", COLLECTOR_TZ)
+log_msg("Partition mode: ", PARTITION_MODE)
 log_msg("Date range: ", START_DATE, " to ", END_DATE)
 log_msg("Block size: ", BLOCK_DAYS, " days")
+log_msg("Maximum requests this run: ", MAX_REQUESTS_PER_RUN)
 log_msg("Stations selected: ", nrow(selected_catalog))
 
 scope_summary <- selected_catalog |>
@@ -325,7 +432,12 @@ read_ledger <- function() {
     )
 }
 
-archive <- read_archive()
+archive <- if (PARTITION_MODE) {
+  empty_archive()
+} else {
+  read_archive()
+}
+
 ledger <- read_ledger()
 
 completed <- ledger |>
@@ -471,6 +583,20 @@ get_ip_block <- function(station, start_date, end_date) {
 
 new_rows_buffer <- list()
 ledger_buffer <- list()
+run_rows_all <- list()
+
+current_run_rows <- function() {
+  if (length(run_rows_all) == 0L) {
+    return(empty_archive())
+  }
+
+  bind_rows(run_rows_all) |>
+    filter(!is.na(station_id), !is.na(date)) |>
+    group_by(station_id, date) |>
+    slice_tail(n = 1L) |>
+    ungroup() |>
+    arrange(watershed, station_id, date)
+}
 
 merge_archive <- function(old_archive, new_rows) {
   if (nrow(new_rows) == 0) return(old_archive)
@@ -529,11 +655,16 @@ checkpoint <- function(force = FALSE) {
     ledger_buffer <<- list()
   }
 
-  write_csv(archive, DATA_FILE, na = "")
+  if (!PARTITION_MODE) {
+    write_csv(archive, DATA_FILE, na = "")
+  }
+
   write_csv(ledger, LEDGER_FILE, na = "")
+  write_csv(current_run_rows(), RUN_ROWS_FILE, na = "")
 
   log_msg(
-    "Checkpoint saved | archive rows: ", nrow(archive),
+    "Checkpoint saved | archive rows in memory: ", nrow(archive),
+    " | run rows: ", nrow(current_run_rows()),
     " | ledger rows: ", nrow(ledger)
   )
 
@@ -585,6 +716,7 @@ if (nrow(plan) > 0) {
     if (!is.null(dat)) {
       if (nrow(dat) > 0) {
         new_rows_buffer[[length(new_rows_buffer) + 1L]] <- dat
+        run_rows_all[[length(run_rows_all) + 1L]] <- dat
         rows_this_run <- rows_this_run + nrow(dat)
         status <- "ok_data"
       } else {
@@ -632,7 +764,7 @@ checkpoint(force = TRUE)
 # 9. COVERAGE AND MONTHLY DIAGNOSTICS
 # =============================================================================
 
-if (nrow(archive) > 0) {
+if (!PARTITION_MODE && nrow(archive) > 0) {
   coverage <- archive |>
     group_by(
       station_id,
@@ -695,6 +827,13 @@ if (nrow(archive) > 0) {
   write_csv(monthly, MONTHLY_FILE, na = "")
 }
 
+if (PARTITION_MODE) {
+  log_msg(
+    "Partition mode active: cumulative coverage/monthly diagnostics were not ",
+    "written because the GitHub worker intentionally restores only the request ledger."
+  )
+}
+
 # =============================================================================
 # 10. FINAL RUN SUMMARY
 # =============================================================================
@@ -715,16 +854,51 @@ expected_total <- nrow(blocks) * nrow(selected_catalog)
 completed_total <- nrow(completed_after)
 remaining_total <- max(0L, expected_total - completed_total)
 
+run_rows_final <- current_run_rows()
+write_csv(run_rows_final, RUN_ROWS_FILE, na = "")
+
+run_summary <- tibble(
+  run_started_at = format(
+    run_started,
+    "%Y-%m-%d %H:%M:%S%z",
+    tz = COLLECTOR_TZ
+  ),
+  run_finished_at = retrieved_at_now(),
+  collector_id = COLLECTOR_ID,
+  github_run_id = optional_env_value(GITHUB_RUN_ID),
+  github_run_attempt = optional_env_value(GITHUB_RUN_ATTEMPT),
+  scraper_code_commit = optional_env_value(GITHUB_SHA),
+  scope_mode = SCOPE_MODE,
+  start_date = as.character(START_DATE),
+  end_date = as.character(END_DATE),
+  stations_selected = nrow(selected_catalog),
+  blocks_per_station = nrow(blocks),
+  expected_requests = expected_total,
+  requests_attempted = request_counter,
+  rows_retrieved = rows_this_run,
+  empty_blocks = empty_this_run,
+  errors = errors_this_run,
+  completed_requests = completed_total,
+  remaining_requests = remaining_total,
+  partition_mode = PARTITION_MODE
+)
+
+write_csv(run_summary, RUN_SUMMARY_FILE, na = "")
+
 log_msg("Requests attempted this run: ", request_counter)
 log_msg("Daily IP rows retrieved this run: ", rows_this_run)
 log_msg("Empty blocks this run: ", empty_this_run)
 log_msg("Errors this run: ", errors_this_run)
-log_msg("Archive rows total: ", nrow(archive))
+log_msg("Run partition rows: ", nrow(run_rows_final))
+if (!PARTITION_MODE) {
+  log_msg("Archive rows total: ", nrow(archive))
+}
 log_msg(
   "Configured block progress: ", completed_total,
   "/", expected_total,
   " completed; ", remaining_total, " remain"
 )
+log_msg("Run summary: ", RUN_SUMMARY_FILE)
 log_msg("FINISH historical Pollution Index extraction")
 
 # Exit non-zero only when every attempted request failed.
