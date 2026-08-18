@@ -1,4 +1,4 @@
-name: ONLIMO Historical Pollution Index Backfill
+name: ONLIMO Historical Pollution Index Catch-up
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ on:
       end_date:
         description: "Historical end date (YYYY-MM-DD or yesterday)"
         required: true
-        default: "2024-09-30"
+        default: "yesterday"
         type: string
 
       max_requests:
@@ -20,6 +20,10 @@ on:
         required: true
         default: "300"
         type: string
+
+  schedule:
+    - cron: "13 2,14 * * *"
+      timezone: "Asia/Taipei"
 
 permissions:
   contents: read
@@ -42,9 +46,9 @@ jobs:
 
       ONLIMO_IP_PARTITION_MODE: "true"
       ONLIMO_IP_SCOPE_MODE: selected_das
-      ONLIMO_IP_START_DATE: ${{ inputs.start_date }}
-      ONLIMO_IP_END_DATE: ${{ inputs.end_date }}
-      ONLIMO_IP_MAX_REQUESTS_PER_RUN: ${{ inputs.max_requests }}
+      ONLIMO_IP_START_DATE: ${{ inputs.start_date || '2024-07-01' }}
+      ONLIMO_IP_END_DATE: ${{ inputs.end_date || 'yesterday' }}
+      ONLIMO_IP_MAX_REQUESTS_PER_RUN: ${{ inputs.max_requests || '300' }}
       ONLIMO_IP_CHECKPOINT_EVERY: "25"
       ONLIMO_IP_REFRESH_COMPLETED: "false"
 
