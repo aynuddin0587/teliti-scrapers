@@ -1,7 +1,11 @@
-name: ONLIMO Daily - Persistent Backup Test
+name: ONLIMO Daily Backup
 
 on:
   workflow_dispatch:
+
+  schedule:
+    - cron: "17 23 * * *"
+      timezone: "Asia/Taipei"
 
 permissions:
   contents: read
@@ -43,6 +47,7 @@ jobs:
             cp \
               teliti-data-backup/onlimo_daily/state/station_state.csv \
               run-data/onlimo/data/onlimo_daily_station_state.csv
+
             echo "Restored persistent ONLIMO station state."
           else
             echo "No persistent ONLIMO station state exists yet."
