@@ -2,8 +2,9 @@
 # Strategy:
 # 1) Fetch the ONLIMO main page once and parse the embedded JavaScript dataMap.
 # 2) Save the latest detailed record for every currently active station.
-# 3) If the local archive shows a short gap, use ajaxGetData only for missing dates.
-# 4) Append, deduplicate by station_id + date, and keep a retrieval log.
+# 3) If the local/cloud state shows a short gap, use ajaxGetData only for missing dates.
+# 4) Keep the existing cumulative local archive for Windows analysis workflows.
+# 5) Also write a per-run delta and compact station-date state for GitHub backup.
 
 library(httr2)
 library(jsonlite)
@@ -21,13 +22,23 @@ TELITI_DATA_ROOT <- Sys.getenv(
   unset = "D:/# R Project/penelitian"
 )
 
-PROJECT_DIR <- file.path(
-  TELITI_DATA_ROOT,
-  "onlimo"
-)
-
+PROJECT_DIR <- file.path(TELITI_DATA_ROOT, "onlimo")
 DATA_DIR    <- file.path(PROJECT_DIR, "data")
 LOG_DIR     <- file.path(PROJECT_DIR, "log")
+
+COLLECTOR_TZ <- Sys.getenv(
+  "TELITI_TIMEZONE",
+  unset = "Asia/Taipei"
+)
+
+COLLECTOR_ID <- Sys.getenv(
+  "TELITI_COLLECTOR_ID",
+  unset = "local_pc"
+)
+
+GITHUB_RUN_ID <- Sys.getenv("GITHUB_RUN_ID", unset = "")
+GITHUB_RUN_ATTEMPT <- Sys.getenv("GITHUB_RUN_ATTEMPT", unset = "")
+GITHUB_SHA <- Sys.getenv("GITHUB_SHA", unset = "")
 
 BASE_PAGE <- "https://onlimo.kemenlh.go.id/app/"
 BASE_API  <- "https://onlimo.kemenlh.go.id/app/index"
@@ -45,36 +56,64 @@ SELECTED_DAS <- c(
 )
 
 # The public detailed-data window is approximately one week.
-# Recovery is attempted only when a station already exists in the local archive.
+# Recovery is attempted only when a station already exists in the local archive
+# or in the compact persistent station-state file.
 RECOVERY_DAYS <- 8L
 MAX_RECOVERY_REQUESTS_PER_RUN <- 600L
 RECOVERY_PAUSE_MIN_SEC <- 1.0
 RECOVERY_PAUSE_MAX_SEC <- 1.8
 
+# Existing cumulative local products.
 ARCHIVE_FILE <- file.path(DATA_DIR, "onlimo_daily_parameters_archive.csv")
 CATALOG_FILE <- file.path(DATA_DIR, "onlimo_station_catalog.csv")
+
+# Cloud-friendly products.
+# RUN_ROWS_FILE contains only rows retrieved by the current execution.
+# STATE_FILE is intentionally small and stores only the latest known date per station.
+RUN_ROWS_FILE <- file.path(DATA_DIR, "onlimo_daily_run_rows.csv.gz")
+STATE_FILE <- file.path(DATA_DIR, "onlimo_daily_station_state.csv")
 
 # -----------------------------------------------------------------------------
 # Setup and logging
 # -----------------------------------------------------------------------------
 
 dir.create(DATA_DIR, recursive = TRUE, showWarnings = FALSE)
-dir.create(LOG_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(LOG_DIR, recursive = TRUE, showWarnings = FALSE)
 
 log_file <- file.path(
   LOG_DIR,
-  paste0("daily_archive_", format(Sys.Date(), "%Y-%m"), ".log")
+  paste0(
+    "daily_archive_",
+    format(Sys.time(), "%Y-%m", tz = COLLECTOR_TZ),
+    ".log"
+  )
 )
 
 log_msg <- function(...) {
   msg <- paste0(..., collapse = "")
-  line <- paste0(format(Sys.time(), "%Y-%m-%d %H:%M:%S"), " | ", msg)
+  line <- paste0(
+    format(
+      Sys.time(),
+      "%Y-%m-%d %H:%M:%S",
+      tz = COLLECTOR_TZ
+    ),
+    " | ",
+    msg
+  )
   cat(line, "\n")
   cat(line, "\n", file = log_file, append = TRUE)
 }
 
 retrieved_at_now <- function() {
-  format(Sys.time(), "%Y-%m-%d %H:%M:%S%z")
+  format(
+    Sys.time(),
+    "%Y-%m-%d %H:%M:%S%z",
+    tz = COLLECTOR_TZ
+  )
+}
+
+optional_env_value <- function(x) {
+  if (nzchar(x)) x else NA_character_
 }
 
 # -----------------------------------------------------------------------------
@@ -130,10 +169,6 @@ perform_request <- function(url, ajax = FALSE) {
 # -----------------------------------------------------------------------------
 
 extract_data_map_json <- function(html_text) {
-  # ONLIMO currently writes the assignment as, for example:
-  #   var dataMap = [...] ;
-  # Note the optional whitespace before the semicolon. Do not depend on the
-  # name of the JavaScript variable that follows dataMap.
   pattern <- "(?s)var\\s+dataMap\\s*=\\s*(\\[.*?\\])\\s*;"
 
   hit <- regexec(pattern, html_text, perl = TRUE)
@@ -163,7 +198,11 @@ fetch_data_map <- function() {
         LOG_DIR,
         paste0(
           "failed_main_page_",
-          format(Sys.time(), "%Y%m%d_%H%M%S"),
+          format(
+            Sys.time(),
+            "%Y%m%d_%H%M%S",
+            tz = COLLECTOR_TZ
+          ),
           ".html"
         )
       )
@@ -198,7 +237,11 @@ station_to_catalog_row <- function(x) {
     longitude = suppressWarnings(as.numeric(pluck_chr(x, "longitude"))),
     weeks = pluck_lgl(x, "weeks"),
     latest_detail_date = as.Date(pluck_chr(x, "tgl_data_default")),
-    catalog_retrieved_at = retrieved_at_now()
+    catalog_retrieved_at = retrieved_at_now(),
+    collector_id = COLLECTOR_ID,
+    github_run_id = optional_env_value(GITHUB_RUN_ID),
+    github_run_attempt = optional_env_value(GITHUB_RUN_ATTEMPT),
+    scraper_code_commit = optional_env_value(GITHUB_SHA)
   )
 }
 
@@ -262,7 +305,11 @@ station_to_detail_row <- function(x, date, source_method) {
     status_colour = status_colour,
 
     source_method = source_method,
-    retrieved_at = retrieved_at_now()
+    retrieved_at = retrieved_at_now(),
+    collector_id = COLLECTOR_ID,
+    github_run_id = optional_env_value(GITHUB_RUN_ID),
+    github_run_attempt = optional_env_value(GITHUB_RUN_ATTEMPT),
+    scraper_code_commit = optional_env_value(GITHUB_SHA)
   )
 }
 
@@ -299,7 +346,7 @@ get_ajax_detail <- function(station, date) {
 }
 
 # -----------------------------------------------------------------------------
-# Archive helpers
+# Archive and persistent-state helpers
 # -----------------------------------------------------------------------------
 
 read_archive <- function() {
@@ -310,16 +357,47 @@ read_archive <- function() {
     show_col_types = FALSE,
     col_types = cols(
       date = col_date(),
-      # Keep retrieval timestamps as ISO text. If left to col_guess(),
-      # readr may parse existing CSV values as POSIXct while newly
-      # downloaded rows are character, which breaks bind_rows().
+      source_method = col_character(),
       retrieved_at = col_character(),
+      collector_id = col_character(),
+      github_run_id = col_character(),
+      github_run_attempt = col_character(),
+      scraper_code_commit = col_character(),
       .default = col_guess()
     )
   ) |>
     mutate(
       date = as.Date(date),
       retrieved_at = as.character(retrieved_at)
+    )
+}
+
+read_station_state <- function() {
+  if (!file.exists(STATE_FILE)) {
+    return(
+      tibble(
+        station_id = character(),
+        last_archived_date = as.Date(character())
+      )
+    )
+  }
+
+  read_csv(
+    STATE_FILE,
+    show_col_types = FALSE,
+    col_types = cols(
+      station_id = col_character(),
+      last_archived_date = col_date()
+    )
+  ) |>
+    transmute(
+      station_id = as.character(station_id),
+      last_archived_date = as.Date(last_archived_date)
+    ) |>
+    filter(
+      !is.na(station_id),
+      nzchar(station_id),
+      !is.na(last_archived_date)
     )
 }
 
@@ -341,13 +419,40 @@ select_catalog_scope <- function(catalog) {
   stop("COLLECT_MODE must be 'all_active' or 'selected_das'.")
 }
 
-build_recovery_plan <- function(catalog_scope, archive) {
-  if (nrow(archive) == 0) return(tibble())
+build_recovery_plan <- function(catalog_scope, archive, station_state) {
+  state_from_archive <- tibble(
+    station_id = character(),
+    last_archived_date = as.Date(character())
+  )
 
-  last_local <- archive |>
-    filter(!is.na(date)) |>
+  if (nrow(archive) > 0) {
+    state_from_archive <- archive |>
+      filter(
+        !is.na(station_id),
+        !is.na(date)
+      ) |>
+      group_by(station_id) |>
+      summarise(
+        last_archived_date = max(date),
+        .groups = "drop"
+      )
+  }
+
+  last_local <- bind_rows(
+    station_state,
+    state_from_archive
+  ) |>
+    filter(
+      !is.na(station_id),
+      !is.na(last_archived_date)
+    ) |>
     group_by(station_id) |>
-    summarise(last_archived_date = max(date), .groups = "drop")
+    summarise(
+      last_archived_date = max(last_archived_date),
+      .groups = "drop"
+    )
+
+  if (nrow(last_local) == 0) return(tibble())
 
   plan <- catalog_scope |>
     select(station_id, latest_detail_date) |>
@@ -363,12 +468,12 @@ build_recovery_plan <- function(catalog_scope, archive) {
     seq_len(nrow(plan)),
     function(i) {
       station <- plan$station_id[[i]]
-      latest  <- plan$latest_detail_date[[i]]
-      last    <- plan$last_archived_date[[i]]
+      latest <- plan$latest_detail_date[[i]]
+      last <- plan$last_archived_date[[i]]
 
       earliest_public_candidate <- latest - (RECOVERY_DAYS - 1L)
       start_date <- max(last + 1L, earliest_public_candidate)
-      end_date   <- latest - 1L
+      end_date <- latest - 1L
 
       if (start_date > end_date) return(tibble())
 
@@ -382,12 +487,67 @@ build_recovery_plan <- function(catalog_scope, archive) {
     slice_head(n = MAX_RECOVERY_REQUESTS_PER_RUN)
 }
 
+build_station_state <- function(old_state, archive, run_rows) {
+  state_from_archive <- tibble(
+    station_id = character(),
+    last_archived_date = as.Date(character())
+  )
+
+  state_from_run <- tibble(
+    station_id = character(),
+    last_archived_date = as.Date(character())
+  )
+
+  if (nrow(archive) > 0) {
+    state_from_archive <- archive |>
+      filter(
+        !is.na(station_id),
+        !is.na(date)
+      ) |>
+      group_by(station_id) |>
+      summarise(
+        last_archived_date = max(date),
+        .groups = "drop"
+      )
+  }
+
+  if (nrow(run_rows) > 0) {
+    state_from_run <- run_rows |>
+      filter(
+        !is.na(station_id),
+        !is.na(date)
+      ) |>
+      group_by(station_id) |>
+      summarise(
+        last_archived_date = max(date),
+        .groups = "drop"
+      )
+  }
+
+  bind_rows(
+    old_state,
+    state_from_archive,
+    state_from_run
+  ) |>
+    filter(
+      !is.na(station_id),
+      !is.na(last_archived_date)
+    ) |>
+    group_by(station_id) |>
+    summarise(
+      last_archived_date = max(last_archived_date),
+      .groups = "drop"
+    ) |>
+    arrange(station_id)
+}
+
 # -----------------------------------------------------------------------------
 # Main run
 # -----------------------------------------------------------------------------
 
 log_msg("START ONLIMO daily archive")
 log_msg("Collection mode: ", COLLECT_MODE)
+log_msg("Collector ID: ", COLLECTOR_ID)
 
 # One main-page request supplies station metadata and the latest detailed record.
 data_map <- tryCatch(
@@ -429,7 +589,16 @@ latest_rows <- data_map |>
 log_msg("Latest detailed rows parsed from dataMap: ", nrow(latest_rows))
 
 old_archive <- read_archive()
-recovery_plan <- build_recovery_plan(catalog_scope, old_archive)
+old_state <- read_station_state()
+
+log_msg("Existing cumulative archive rows: ", nrow(old_archive))
+log_msg("Existing station-state rows: ", nrow(old_state))
+
+recovery_plan <- build_recovery_plan(
+  catalog_scope,
+  old_archive,
+  old_state
+)
 
 log_msg("Recovery requests planned: ", nrow(recovery_plan))
 
@@ -440,7 +609,7 @@ if (nrow(recovery_plan) > 0) {
     seq_len(nrow(recovery_plan)),
     function(i) {
       station <- recovery_plan$station_id[[i]]
-      date    <- recovery_plan$date[[i]]
+      date <- recovery_plan$date[[i]]
 
       log_msg(
         "Recovery request ", i, "/", nrow(recovery_plan),
@@ -470,6 +639,34 @@ new_rows <- bind_rows(latest_rows, recovered_rows) |>
     retrieved_at = as.character(retrieved_at)
   )
 
+# Deduplicate the current execution before writing its cloud-friendly delta.
+run_rows <- new_rows |>
+  filter(
+    !is.na(station_id),
+    !is.na(date)
+  ) |>
+  group_by(station_id, date) |>
+  slice_tail(n = 1) |>
+  ungroup() |>
+  arrange(station_id, date)
+
+# Never leave a stale run-delta file from a previous local execution.
+if (file.exists(RUN_ROWS_FILE)) {
+  unlink(RUN_ROWS_FILE)
+}
+
+if (nrow(run_rows) > 0) {
+  write_csv(
+    run_rows,
+    RUN_ROWS_FILE,
+    na = ""
+  )
+  log_msg("Current-run delta rows: ", nrow(run_rows))
+  log_msg("Current-run delta file: ", RUN_ROWS_FILE)
+} else {
+  log_msg("Current-run delta rows: 0")
+}
+
 # Normalize the reloaded CSV before merging. This makes repeated scheduled
 # runs idempotent even if readr previously inferred retrieved_at as POSIXct.
 if (nrow(old_archive) > 0) {
@@ -480,13 +677,14 @@ if (nrow(old_archive) > 0) {
     )
 }
 
-if (nrow(new_rows) == 0 && nrow(old_archive) == 0) {
-  log_msg("No detailed records were retrieved; archive not written.")
+archive <- old_archive
+
+if (nrow(run_rows) == 0 && nrow(old_archive) == 0) {
+  log_msg("No detailed records were retrieved; cumulative archive not written.")
 } else {
   # bind_rows() preserves input order: old archive first, current retrievals last.
-  # Therefore slice_tail() implements a simple last-write-wins rule for each
-  # station-date without relying on timestamp classes or timezone parsing.
-  archive <- bind_rows(old_archive, new_rows) |>
+  # Therefore slice_tail() implements a last-write-wins rule for station-date.
+  archive <- bind_rows(old_archive, run_rows) |>
     mutate(
       date = as.Date(date),
       retrieved_at = as.character(retrieved_at)
@@ -499,9 +697,28 @@ if (nrow(new_rows) == 0 && nrow(old_archive) == 0) {
 
   write_csv(archive, ARCHIVE_FILE, na = "")
 
-  log_msg("New rows this run: ", nrow(new_rows))
+  log_msg("New rows this run: ", nrow(run_rows))
   log_msg("Archive rows after deduplication: ", nrow(archive))
   log_msg("Archive stations represented: ", n_distinct(archive$station_id))
+}
+
+# Compact state is persistent across GitHub runners and is also useful locally.
+station_state <- build_station_state(
+  old_state,
+  archive,
+  run_rows
+)
+
+if (nrow(station_state) > 0) {
+  write_csv(
+    station_state,
+    STATE_FILE,
+    na = ""
+  )
+  log_msg("Station-state rows: ", nrow(station_state))
+  log_msg("Station-state file: ", STATE_FILE)
+} else {
+  log_msg("Station-state rows: 0")
 }
 
 log_msg("FINISH ONLIMO daily archive")
