@@ -1,5 +1,8 @@
 # ============================================================
 # Prepare CNEMC surface-water output for persistent Git backup
+# Retention policy: keep a full raw + processed checkpoint at
+# most once per 6-hour bucket; retain a compact manifest entry
+# for every changed source snapshot.
 # ============================================================
 
 options(stringsAsFactors = FALSE)
@@ -114,10 +117,7 @@ copy_new_file <- function(source, destination) {
   )
 
   if (file.exists(destination)) {
-    message(
-      "Already present: ",
-      destination
-    )
+    message("Already present: ", destination)
     return(FALSE)
   }
 
@@ -131,16 +131,12 @@ copy_new_file <- function(source, destination) {
     stop(
       "Failed to copy:\n",
       source,
-      "\n→ ",
+      "\n-> ",
       destination
     )
   }
 
-  message(
-    "Added: ",
-    destination
-  )
-
+  message("Added: ", destination)
   TRUE
 }
 
@@ -174,15 +170,28 @@ get_field <- function(x, name, default = NA) {
   value
 }
 
+read_first_line <- function(path) {
+  if (!file.exists(path)) {
+    return(NA_character_)
+  }
+
+  x <- readLines(path, warn = FALSE)
+
+  if (length(x) == 0L) {
+    return(NA_character_)
+  }
+
+  value <- trimws(x[1L])
+  if (!nzchar(value)) NA_character_ else value
+}
+
 # ------------------------------------------------------------
 # 3. Read current CNEMC metadata
 # ------------------------------------------------------------
 
 meta <- readRDS(CURRENT_META)
 
-snapshot_md5 <- as.character(
-  meta$snapshot_md5
-)
+snapshot_md5 <- as.character(meta$snapshot_md5)
 
 if (
   length(snapshot_md5) != 1L ||
@@ -213,43 +222,27 @@ stamp <- format(
   tz = TIMEZONE
 )
 
-year <- format(
-  checked_at,
-  "%Y",
-  tz = TIMEZONE
+year <- format(checked_at, "%Y", tz = TIMEZONE)
+month <- format(checked_at, "%m", tz = TIMEZONE)
+day <- format(checked_at, "%d", tz = TIMEZONE)
+hour <- as.integer(format(checked_at, "%H", tz = TIMEZONE))
+
+hash_short <- substr(snapshot_md5, 1L, 12L)
+
+# Six-hour retention buckets: 00-05, 06-11, 12-17, 18-23.
+bucket_hour <- floor(hour / 6L) * 6L
+retention_bucket <- sprintf(
+  "%s_%02d",
+  format(checked_at, "%Y%m%d", tz = TIMEZONE),
+  bucket_hour
 )
 
-month <- format(
-  checked_at,
-  "%m",
-  tz = TIMEZONE
-)
-
-day <- format(
-  checked_at,
-  "%d",
-  tz = TIMEZONE
-)
-
-hash_short <- substr(
-  snapshot_md5,
-  1L,
-  12L
-)
-
-message(
-  "CNEMC snapshot md5: ",
-  snapshot_md5
-)
-
+message("CNEMC snapshot md5: ", snapshot_md5)
 message(
   "CNEMC collected at: ",
-  format(
-    checked_at,
-    "%Y-%m-%d %H:%M:%S %Z",
-    tz = TIMEZONE
-  )
+  format(checked_at, "%Y-%m-%d %H:%M:%S %Z", tz = TIMEZONE)
 )
+message("CNEMC retention bucket: ", retention_bucket)
 
 # ------------------------------------------------------------
 # 4. Persistent backup directories
@@ -260,20 +253,9 @@ BACKUP_ROOT <- file.path(
   "cnemc_surfacewater"
 )
 
-STATE_DIR <- file.path(
-  BACKUP_ROOT,
-  "state"
-)
-
-MANIFEST_DIR <- file.path(
-  BACKUP_ROOT,
-  "manifests"
-)
-
-DICTIONARY_DIR <- file.path(
-  BACKUP_ROOT,
-  "dictionaries"
-)
+STATE_DIR <- file.path(BACKUP_ROOT, "state")
+MANIFEST_DIR <- file.path(BACKUP_ROOT, "manifests")
+DICTIONARY_DIR <- file.path(BACKUP_ROOT, "dictionaries")
 
 SNAPSHOT_REL_DIR <- file.path(
   "cnemc_surfacewater",
@@ -288,37 +270,16 @@ SNAPSHOT_DIR <- file.path(
   SNAPSHOT_REL_DIR
 )
 
-dir.create(
-  STATE_DIR,
-  recursive = TRUE,
-  showWarnings = FALSE
-)
-
-dir.create(
-  MANIFEST_DIR,
-  recursive = TRUE,
-  showWarnings = FALSE
-)
-
-dir.create(
-  DICTIONARY_DIR,
-  recursive = TRUE,
-  showWarnings = FALSE
-)
-
-dir.create(
-  SNAPSHOT_DIR,
-  recursive = TRUE,
-  showWarnings = FALSE
-)
+dir.create(STATE_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(MANIFEST_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(DICTIONARY_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(SNAPSHOT_DIR, recursive = TRUE, showWarnings = FALSE)
 
 # ------------------------------------------------------------
 # 5. Content-addressed dictionaries
 # ------------------------------------------------------------
 
-area_river_md5 <- md5_file(
-  AREA_RIVER_CURRENT
-)
+area_river_md5 <- md5_file(AREA_RIVER_CURRENT)
 
 area_river_name <- paste0(
   "area_river_",
@@ -336,9 +297,7 @@ copy_new_file(
   area_river_destination
 )
 
-header_dictionary_md5 <- md5_file(
-  HEADER_DICTIONARY
-)
+header_dictionary_md5 <- md5_file(HEADER_DICTIONARY)
 
 header_dictionary_name <- paste0(
   "header_dictionary_",
@@ -357,7 +316,7 @@ copy_new_file(
 )
 
 # ------------------------------------------------------------
-# 6. Detect whether this snapshot is already backed up
+# 6. Detect source changes and retention checkpoint status
 # ------------------------------------------------------------
 
 LATEST_HASH_FILE <- file.path(
@@ -365,112 +324,118 @@ LATEST_HASH_FILE <- file.path(
   "latest_snapshot_md5.txt"
 )
 
-previous_snapshot_md5 <- NA_character_
+LATEST_FULL_BUCKET_FILE <- file.path(
+  STATE_DIR,
+  "latest_full_checkpoint_bucket.txt"
+)
 
-if (file.exists(LATEST_HASH_FILE)) {
-
-  previous_lines <- readLines(
-    LATEST_HASH_FILE,
-    warn = FALSE
-  )
-
-  if (length(previous_lines) > 0L) {
-    previous_snapshot_md5 <- trimws(
-      previous_lines[1L]
-    )
-  }
-}
+previous_snapshot_md5 <- read_first_line(LATEST_HASH_FILE)
+previous_full_bucket <- read_first_line(LATEST_FULL_BUCKET_FILE)
 
 snapshot_changed <- (
   is.na(previous_snapshot_md5) ||
-    !identical(
-      previous_snapshot_md5,
-      snapshot_md5
+    !identical(previous_snapshot_md5, snapshot_md5)
+)
+
+retain_full_checkpoint <- (
+  snapshot_changed &&
+    (
+      is.na(previous_full_bucket) ||
+        !identical(previous_full_bucket, retention_bucket)
     )
 )
 
+message("Previous snapshot md5: ", ifelse(is.na(previous_snapshot_md5), "<none>", previous_snapshot_md5))
+message("Snapshot changed: ", snapshot_changed)
+message("Previous full checkpoint bucket: ", ifelse(is.na(previous_full_bucket), "<none>", previous_full_bucket))
+message("Retain full checkpoint this run: ", retain_full_checkpoint)
+
+# ------------------------------------------------------------
+# 7. Handle changed snapshot
+# ------------------------------------------------------------
+
 if (!snapshot_changed) {
 
-  message(
-    "Snapshot already backed up; no new snapshot files required."
-  )
+  message("Snapshot already represented in backup state; no new manifest row required.")
 
 } else {
 
-  message(
-    "New CNEMC snapshot detected."
-  )
+  current_run <- read_last_manifest_row(RUN_MANIFEST)
 
-  # ----------------------------------------------------------
-  # 7. Append-only raw and processed snapshot files
-  # ----------------------------------------------------------
+  raw_relative_path <- NA_character_
+  processed_relative_path <- NA_character_
 
-  snapshot_stem <- paste0(
-    "cnemc_surfacewater_",
-    stamp,
-    "_",
-    hash_short
-  )
+  if (retain_full_checkpoint) {
 
-  raw_filename <- paste0(
-    snapshot_stem,
-    "_raw.rds"
-  )
+    snapshot_stem <- paste0(
+      "cnemc_surfacewater_",
+      stamp,
+      "_",
+      hash_short
+    )
 
-  processed_filename <- paste0(
-    snapshot_stem,
-    "_processed.csv.gz"
-  )
+    raw_filename <- paste0(snapshot_stem, "_raw.rds")
+    processed_filename <- paste0(snapshot_stem, "_processed.csv.gz")
 
-  raw_relative_path <- file.path(
-    SNAPSHOT_REL_DIR,
-    raw_filename
-  )
+    raw_relative_path <- file.path(
+      SNAPSHOT_REL_DIR,
+      raw_filename
+    )
 
-  processed_relative_path <- file.path(
-    SNAPSHOT_REL_DIR,
-    processed_filename
-  )
+    processed_relative_path <- file.path(
+      SNAPSHOT_REL_DIR,
+      processed_filename
+    )
 
-  raw_destination <- file.path(
-    BACKUP_REPO,
-    raw_relative_path
-  )
+    raw_destination <- file.path(
+      BACKUP_REPO,
+      raw_relative_path
+    )
 
-  processed_destination <- file.path(
-    BACKUP_REPO,
-    processed_relative_path
-  )
+    processed_destination <- file.path(
+      BACKUP_REPO,
+      processed_relative_path
+    )
 
-  if (
-    file.exists(raw_destination) ||
-    file.exists(processed_destination)
-  ) {
-    stop(
-      paste0(
-        "Snapshot destination already exists while state hash differs.\n",
-        "Refusing to overwrite an append-only backup."
+    if (
+      file.exists(raw_destination) ||
+      file.exists(processed_destination)
+    ) {
+      stop(
+        paste0(
+          "Full checkpoint destination already exists while state differs.\n",
+          "Refusing to overwrite an append-only backup."
+        )
       )
+    }
+
+    copy_new_file(CURRENT_RAW, raw_destination)
+    copy_new_file(CURRENT_PROCESSED, processed_destination)
+
+    writeLines(
+      retention_bucket,
+      con = LATEST_FULL_BUCKET_FILE,
+      useBytes = TRUE
+    )
+
+    message(
+      "Stored full CNEMC checkpoint for retention bucket ",
+      retention_bucket
+    )
+
+  } else {
+
+    message(
+      "Changed CNEMC snapshot recorded as manifest/hash only; ",
+      "a full checkpoint already exists for retention bucket ",
+      retention_bucket,
+      "."
     )
   }
-
-  copy_new_file(
-    CURRENT_RAW,
-    raw_destination
-  )
-
-  copy_new_file(
-    CURRENT_PROCESSED,
-    processed_destination
-  )
 
   # ----------------------------------------------------------
   # 8. Append persistent snapshot manifest
   # ----------------------------------------------------------
-
-  current_run <- read_last_manifest_row(
-    RUN_MANIFEST
-  )
 
   snapshot_manifest_path <- file.path(
     MANIFEST_DIR,
@@ -484,47 +449,24 @@ if (!snapshot_changed) {
       tz = TIMEZONE
     ),
     snapshot_md5 = snapshot_md5,
-    rows = get_field(
-      current_run,
-      "rows",
-      NA_integer_
-    ),
-    total_pages = get_field(
-      current_run,
-      "total_pages",
-      NA_integer_
-    ),
-    page_size = get_field(
-      current_run,
-      "page_size",
-      NA_integer_
-    ),
+    rows = get_field(current_run, "rows", NA_integer_),
+    total_pages = get_field(current_run, "total_pages", NA_integer_),
+    page_size = get_field(current_run, "page_size", NA_integer_),
     collector_id = Sys.getenv(
       "TELITI_COLLECTOR_ID",
       unset = "github_actions"
     ),
-    github_run_id = Sys.getenv(
-      "GITHUB_RUN_ID",
-      unset = ""
-    ),
-    github_run_attempt = Sys.getenv(
-      "GITHUB_RUN_ATTEMPT",
-      unset = ""
-    ),
-    scraper_code_commit = Sys.getenv(
-      "GITHUB_SHA",
-      unset = ""
-    ),
-    raw_file = raw_relative_path,
-    processed_file = processed_relative_path,
+    github_run_id = Sys.getenv("GITHUB_RUN_ID", unset = ""),
+    github_run_attempt = Sys.getenv("GITHUB_RUN_ATTEMPT", unset = ""),
+    scraper_code_commit = Sys.getenv("GITHUB_SHA", unset = ""),
+    raw_file = ifelse(is.na(raw_relative_path), "", raw_relative_path),
+    processed_file = ifelse(is.na(processed_relative_path), "", processed_relative_path),
     area_river_md5 = area_river_md5,
     header_dictionary_md5 = header_dictionary_md5,
     stringsAsFactors = FALSE
   )
 
-  manifest_exists <- file.exists(
-    snapshot_manifest_path
-  )
+  manifest_exists <- file.exists(snapshot_manifest_path)
 
   utils::write.table(
     manifest_entry,
@@ -545,7 +487,7 @@ if (!snapshot_changed) {
   )
 
   # ----------------------------------------------------------
-  # 9. Update latest snapshot state
+  # 9. Update latest source state
   # ----------------------------------------------------------
 
   writeLines(
@@ -567,4 +509,6 @@ if (!snapshot_changed) {
 message("")
 message("CNEMC persistent-backup preparation complete.")
 message("Snapshot changed: ", snapshot_changed)
+message("Full checkpoint retained: ", retain_full_checkpoint)
+message("Retention bucket: ", retention_bucket)
 message("Backup repository: ", BACKUP_REPO)
