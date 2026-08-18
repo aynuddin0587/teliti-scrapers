@@ -1,8 +1,9 @@
 # ============================================================
 # Prepare CNEMC surface-water output for persistent Git backup
 # Retention policy: keep a full raw + processed checkpoint at
-# most once per 6-hour bucket; retain a compact manifest entry
-# for every changed source snapshot.
+# most once per 6-hour bucket; retain a compact snapshot manifest
+# for changed source states and a lightweight collection manifest
+# for every GitHub collection run.
 # ============================================================
 
 options(stringsAsFactors = FALSE)
@@ -351,7 +352,98 @@ message("Previous full checkpoint bucket: ", ifelse(is.na(previous_full_bucket),
 message("Retain full checkpoint this run: ", retain_full_checkpoint)
 
 # ------------------------------------------------------------
-# 7. Handle changed snapshot
+# 7. Append lightweight collection manifest for EVERY run
+# ------------------------------------------------------------
+
+current_run <- read_last_manifest_row(RUN_MANIFEST)
+
+collection_manifest_path <- file.path(
+  MANIFEST_DIR,
+  "collection_manifest.csv"
+)
+
+github_run_id <- Sys.getenv("GITHUB_RUN_ID", unset = "")
+github_run_attempt <- Sys.getenv("GITHUB_RUN_ATTEMPT", unset = "")
+collector_id <- Sys.getenv(
+  "TELITI_COLLECTOR_ID",
+  unset = "github_actions"
+)
+
+collection_key <- if (nzchar(github_run_id)) {
+  paste0(github_run_id, "-", github_run_attempt)
+} else {
+  paste0(stamp, "-", hash_short)
+}
+
+collection_entry <- data.frame(
+  collection_key = collection_key,
+  collected_at = format(
+    checked_at,
+    "%Y-%m-%d %H:%M:%S%z",
+    tz = TIMEZONE
+  ),
+  snapshot_md5 = snapshot_md5,
+  changed = snapshot_changed,
+  rows = get_field(current_run, "rows", NA_integer_),
+  unique_row_hashes = get_field(
+    current_run,
+    "unique_row_hashes",
+    NA_integer_
+  ),
+  total_pages = get_field(current_run, "total_pages", NA_integer_),
+  page_size = get_field(current_run, "page_size", NA_integer_),
+  collector_id = collector_id,
+  github_run_id = github_run_id,
+  github_run_attempt = github_run_attempt,
+  scraper_code_commit = Sys.getenv("GITHUB_SHA", unset = ""),
+  retention_bucket = retention_bucket,
+  full_checkpoint_retained = retain_full_checkpoint,
+  stringsAsFactors = FALSE
+)
+
+collection_exists <- file.exists(collection_manifest_path)
+collection_already_recorded <- FALSE
+
+if (collection_exists) {
+  old_collection <- utils::read.csv(
+    collection_manifest_path,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+
+  if ("collection_key" %in% names(old_collection)) {
+    collection_already_recorded <- collection_key %in% old_collection$collection_key
+  }
+}
+
+if (!collection_already_recorded) {
+  utils::write.table(
+    collection_entry,
+    file = collection_manifest_path,
+    sep = ",",
+    row.names = FALSE,
+    col.names = !collection_exists,
+    append = collection_exists,
+    quote = TRUE,
+    qmethod = "double",
+    na = "",
+    fileEncoding = "UTF-8"
+  )
+
+  message(
+    "Updated collection manifest: ",
+    collection_manifest_path
+  )
+} else {
+  message(
+    "Collection manifest already contains key ",
+    collection_key,
+    "; no duplicate row appended."
+  )
+}
+
+# ------------------------------------------------------------
+# 8. Handle changed snapshot
 # ------------------------------------------------------------
 
 if (!snapshot_changed) {
@@ -359,8 +451,6 @@ if (!snapshot_changed) {
   message("Snapshot already represented in backup state; no new manifest row required.")
 
 } else {
-
-  current_run <- read_last_manifest_row(RUN_MANIFEST)
 
   raw_relative_path <- NA_character_
   processed_relative_path <- NA_character_
@@ -434,7 +524,7 @@ if (!snapshot_changed) {
   }
 
   # ----------------------------------------------------------
-  # 8. Append persistent snapshot manifest
+  # 9. Append persistent snapshot manifest
   # ----------------------------------------------------------
 
   snapshot_manifest_path <- file.path(
@@ -487,7 +577,7 @@ if (!snapshot_changed) {
   )
 
   # ----------------------------------------------------------
-  # 9. Update latest source state
+  # 10. Update latest source state
   # ----------------------------------------------------------
 
   writeLines(
@@ -503,7 +593,7 @@ if (!snapshot_changed) {
 }
 
 # ------------------------------------------------------------
-# 10. Summary
+# 11. Summary
 # ------------------------------------------------------------
 
 message("")
@@ -511,4 +601,5 @@ message("CNEMC persistent-backup preparation complete.")
 message("Snapshot changed: ", snapshot_changed)
 message("Full checkpoint retained: ", retain_full_checkpoint)
 message("Retention bucket: ", retention_bucket)
+message("Collection manifest: ", collection_manifest_path)
 message("Backup repository: ", BACKUP_REPO)
