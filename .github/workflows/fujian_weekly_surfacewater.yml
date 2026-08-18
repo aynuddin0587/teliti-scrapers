@@ -1,7 +1,11 @@
-name: Fujian Weekly Surface Water - Persistent Backup Test
+name: Fujian Weekly Surface Water Backup
 
 on:
   workflow_dispatch:
+
+  schedule:
+    - cron: "37 13 * * 0"
+      timezone: "Asia/Taipei"
 
 permissions:
   contents: read
