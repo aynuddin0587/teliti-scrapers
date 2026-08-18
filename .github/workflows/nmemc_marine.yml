@@ -1,0 +1,111 @@
+name: NMEMC Marine Water - Persistent Backup Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nmemc-marine-water-backup
+  cancel-in-progress: false
+
+jobs:
+  backup-nmemc-marine:
+    runs-on: ubuntu-24.04
+
+    env:
+      TZ: Asia/Taipei
+      TELITI_TIMEZONE: Asia/Taipei
+      TELITI_COLLECTOR_ID: github_actions
+      TELITI_DATA_ROOT: ${{ github.workspace }}/run-data
+      TELITI_BACKUP_REPO: ${{ github.workspace }}/teliti-data-backup
+
+    steps:
+      - name: Check out scraper repository
+        uses: actions/checkout@v7
+
+      - name: Check out private data backup repository
+        uses: actions/checkout@v7
+        with:
+          repository: aynuddin0587/teliti-data-backup
+          ref: main
+          path: teliti-data-backup
+          ssh-key: ${{ secrets.TELITI_DATA_DEPLOY_KEY }}
+          persist-credentials: true
+          fetch-depth: 1
+
+      - name: Restore NMEMC marine source state
+        run: |
+          mkdir -p run-data/nmemc/data/raw
+
+          if [ -d teliti-data-backup/nmemc_marine/state/raw ]; then
+            cp -a \
+              teliti-data-backup/nmemc_marine/state/raw/. \
+              run-data/nmemc/data/raw/
+
+            echo "Restored persistent NMEMC marine source state."
+          else
+            echo "No persistent NMEMC marine source state exists yet."
+            echo "This will be the first GitHub NMEMC marine backfill."
+          fi
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.6.1"
+          use-public-rspm: true
+
+      - name: Restore R environment
+        uses: r-lib/actions/setup-renv@v2
+
+      - name: Run NMEMC marine backfill check
+        run: |
+          Rscript nmemc/script/01_nmemc_water_archive.R backfill
+
+      - name: Prepare persistent NMEMC marine backup
+        run: |
+          Rscript .github/scripts/prepare_nmemc_marine_backup.R
+
+      - name: Show backup repository changes
+        working-directory: teliti-data-backup
+        run: |
+          echo "Candidate NMEMC marine backup changes:"
+          git status --short
+
+      - name: Commit and push NMEMC marine backup
+        working-directory: teliti-data-backup
+        run: |
+          git config user.name "teliti-github-actions"
+          git config user.email "teliti-github-actions@users.noreply.github.com"
+
+          git add nmemc_marine/
+
+          if git diff --cached --quiet; then
+            echo "NMEMC marine source files are unchanged."
+            echo "Nothing to commit."
+          else
+            echo "Files to be committed:"
+            git diff --cached --name-status
+
+            git commit -m "Update NMEMC marine water backup"
+            git push origin main
+          fi
+
+      - name: Show final backup status
+        working-directory: teliti-data-backup
+        run: |
+          git status
+          git log --oneline -3
+
+      - name: Upload diagnostics if workflow fails
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nmemc-marine-failure-${{ github.run_id }}
+          path: |
+            run-data/nmemc/log/
+            run-data/nmemc/data/raw/
+            run-data/nmemc/data/processed/nmemc_water_manifest.csv
+          if-no-files-found: warn
+          retention-days: 7
