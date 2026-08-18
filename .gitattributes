@@ -8,6 +8,7 @@
 *.md text eol=lf
 *.gitignore text eol=lf
 *.gitattributes text eol=lf
+*.sh text eol=lf
 
 # Windows command files remain Windows-style
 *.cmd text eol=crlf
