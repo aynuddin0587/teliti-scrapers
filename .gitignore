@@ -78,6 +78,7 @@
 # 6. Teliti reconciliation code
 # ------------------------------------------------------------
 !/teliti_reconciliation/
+/teliti_reconciliation/output/**
 !/teliti_reconciliation/script/
 !/teliti_reconciliation/script/**
 !/teliti_reconciliation/registry/
