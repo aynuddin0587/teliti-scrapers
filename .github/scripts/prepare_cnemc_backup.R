@@ -5,18 +5,21 @@
 # ---------------------------
 # 1. Record EVERY GitHub collection in collection_manifest.csv.
 # 2. Record every changed source state in snapshot_manifest.csv.
-# 3. Keep at most one full raw + processed checkpoint per 6-hour bucket.
-# 4. Preserve every previously unseen scientific row version in compact,
-#    append-only daily row-version delta files.
-# 5. Preserve row-membership add/remove events between successive source
-#    states, allowing the exact changing source state to be audited from a
-#    baseline plus membership events.
-# 6. Maintain a lightweight append-only row-version index and a current
-#    row-membership state file for efficient future comparisons.
+# 3. Keep at most one full nationwide raw + processed checkpoint per
+#    6-hour bucket.
+# 4. Preserve every previously unseen row version for the configured
+#    target area(s) in immutable gzip-compressed per-run delta files.
+#    Default target: Fujian Province (福建省).
+# 5. Do NOT persist row-by-row nationwide membership events. Instead,
+#    retain only add/remove counts in the targeted delta manifest and keep
+#    the latest membership state for the next-run comparison.
+# 6. Maintain a lightweight row-version index for archived versions.
 #
-# The first run of this version creates a one-time delta baseline and seeds
-# the row-version index from already retained processed checkpoints so that
-# historic row versions are not unnecessarily duplicated.
+# Rationale: CNEMC refreshes much of the nationwide station set roughly
+# hourly. Archiving every nationwide row version in plain CSV would grow
+# too quickly for Git. High-frequency row preservation is therefore
+# limited to the research target area(s), while nationwide context is
+# retained through 6-hour full checkpoints and collection manifests.
 # ============================================================
 
 options(stringsAsFactors = FALSE)
@@ -28,6 +31,17 @@ options(stringsAsFactors = FALSE)
 DATA_ROOT <- Sys.getenv("TELITI_DATA_ROOT", unset = "")
 BACKUP_REPO <- Sys.getenv("TELITI_BACKUP_REPO", unset = "")
 TIMEZONE <- Sys.getenv("TELITI_TIMEZONE", unset = "Asia/Taipei")
+
+TARGET_AREAS_RAW <- Sys.getenv(
+  "CNEMC_DELTA_AREAS",
+  unset = "福建省"
+)
+TARGET_AREAS <- trimws(strsplit(TARGET_AREAS_RAW, ",", fixed = TRUE)[[1]])
+TARGET_AREAS <- TARGET_AREAS[nzchar(TARGET_AREAS)]
+
+if (length(TARGET_AREAS) == 0L) {
+  stop("CNEMC_DELTA_AREAS resolved to no target areas.")
+}
 
 if (!nzchar(DATA_ROOT)) {
   stop("TELITI_DATA_ROOT is not defined.")
@@ -187,6 +201,36 @@ append_csv_utf8 <- function(x, path) {
     qmethod = "double",
     na = "",
     fileEncoding = "UTF-8"
+  )
+
+  invisible(TRUE)
+}
+
+write_csv_gz_utf8 <- function(x, path) {
+  x <- as.data.frame(x, stringsAsFactors = FALSE)
+
+  if (nrow(x) == 0L) {
+    return(invisible(FALSE))
+  }
+
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+
+  if (file.exists(path)) {
+    stop("Refusing to overwrite immutable targeted delta file: ", path)
+  }
+
+  con <- gzfile(path, open = "wt", encoding = "UTF-8")
+  on.exit(close(con), add = TRUE)
+
+  utils::write.table(
+    x,
+    file = con,
+    sep = ",",
+    row.names = FALSE,
+    col.names = TRUE,
+    quote = TRUE,
+    qmethod = "double",
+    na = ""
   )
 
   invisible(TRUE)
@@ -522,25 +566,27 @@ SNAPSHOT_MANIFEST <- file.path(
 )
 DELTA_MANIFEST <- file.path(
   MANIFEST_DIR,
-  "delta_manifest.csv"
+  "targeted_delta_manifest.csv"
 )
 
-ROW_VERSION_DAILY_REL <- file.path(
-  DELTA_REL_DIR,
-  "row_versions.csv"
+TARGET_DELTA_REL_DIR <- file.path(
+  "cnemc_surfacewater",
+  "deltas",
+  "targeted",
+  year,
+  month,
+  day
 )
-ROW_VERSION_DAILY <- file.path(
-  BACKUP_REPO,
-  ROW_VERSION_DAILY_REL
-)
+TARGET_DELTA_DIR <- file.path(BACKUP_REPO, TARGET_DELTA_REL_DIR)
+dir.create(TARGET_DELTA_DIR, recursive = TRUE, showWarnings = FALSE)
 
-MEMBERSHIP_DAILY_REL <- file.path(
-  DELTA_REL_DIR,
-  "membership_events.csv"
+TARGET_ROW_VERSION_REL <- file.path(
+  TARGET_DELTA_REL_DIR,
+  paste0("row_versions_", stamp, "_", hash_short, ".csv.gz")
 )
-MEMBERSHIP_DAILY <- file.path(
+TARGET_ROW_VERSION_FILE <- file.path(
   BACKUP_REPO,
-  MEMBERSHIP_DAILY_REL
+  TARGET_ROW_VERSION_REL
 )
 
 # ------------------------------------------------------------
@@ -702,22 +748,46 @@ membership_missing <- !file.exists(LATEST_MEMBERSHIP_FILE)
 delta_bootstrap <- index_missing || baseline_missing || membership_missing
 
 # ------------------------------------------------------------
-# 10. Identify previously unseen row versions
+# 10. Identify target-area row versions worth archiving
 # ------------------------------------------------------------
 
-new_version_mask <- !(
-  current_unique$row_hash %in% known_row_hashes_before
-)
-new_rows <- current_unique[new_version_mask, , drop = FALSE]
+previous_membership <- read_csv_if_exists(LATEST_MEMBERSHIP_FILE)
 
-if (nrow(new_rows) > 0L) {
-  new_rows$delta_archived_at <- collected_at_text
-  new_rows$delta_snapshot_md5 <- snapshot_md5
-  new_rows$delta_collection_key <- collection_key
-  new_rows$delta_class <- ifelse(
-    new_rows$observation_key_hash %in% known_observation_keys_before,
-    "revised_observation_version",
-    "new_observation_key"
+if (is.null(previous_membership)) {
+  previous_membership <- data.frame(
+    row_hash = character(),
+    observation_key_hash = character(),
+    stringsAsFactors = FALSE
+  )
+  membership_bootstrap <- TRUE
+} else {
+  previous_membership <- clean_hash_table(previous_membership)
+  membership_bootstrap <- FALSE
+}
+
+if (!"area" %in% names(current_unique)) {
+  stop("Current CNEMC data do not contain the required 'area' column.")
+}
+
+new_version_mask <- !(current_unique$row_hash %in% known_row_hashes_before)
+candidate_rows <- current_unique[new_version_mask, , drop = FALSE]
+
+target_mask <- (
+  !is.na(candidate_rows$area) &
+    as.character(candidate_rows$area) %in% TARGET_AREAS
+)
+
+target_rows <- candidate_rows[target_mask, , drop = FALSE]
+non_target_new_versions_skipped_n <- nrow(candidate_rows) - nrow(target_rows)
+
+if (nrow(target_rows) > 0L) {
+  target_rows$delta_archived_at <- collected_at_text
+  target_rows$delta_snapshot_md5 <- snapshot_md5
+  target_rows$delta_collection_key <- collection_key
+  target_rows$delta_class <- ifelse(
+    target_rows$observation_key_hash %in% known_observation_keys_before,
+    "target_revised_observation_version",
+    "target_new_observation_key"
   )
 
   metadata_cols <- c(
@@ -727,72 +797,86 @@ if (nrow(new_rows) > 0L) {
     "delta_class"
   )
 
-  new_rows <- new_rows[
-    c(metadata_cols, setdiff(names(new_rows), metadata_cols)),
+  target_rows <- target_rows[
+    c(metadata_cols, setdiff(names(target_rows), metadata_cols)),
     drop = FALSE
   ]
 }
 
-new_observation_keys_n <- if (nrow(new_rows) > 0L) {
+target_new_observation_keys_n <- if (nrow(target_rows) > 0L) {
   length(unique(
-    new_rows$observation_key_hash[
-      !(new_rows$observation_key_hash %in% known_observation_keys_before)
+    target_rows$observation_key_hash[
+      !(target_rows$observation_key_hash %in% known_observation_keys_before)
     ]
   ))
 } else {
   0L
 }
 
-revised_row_versions_n <- if (nrow(new_rows) > 0L) {
-  sum(
-    new_rows$observation_key_hash %in% known_observation_keys_before
-  )
+target_revised_row_versions_n <- if (nrow(target_rows) > 0L) {
+  sum(target_rows$observation_key_hash %in% known_observation_keys_before)
 } else {
   0L
 }
 
 row_versions_written_rel <- ""
 
-if (nrow(new_rows) > 0L) {
+if (nrow(target_rows) > 0L) {
   if (delta_bootstrap) {
-    # The one-time baseline already contains the complete current rows.
+    # The baseline already contains the complete current nationwide rows.
     row_versions_written_rel <- baseline_relative_path
     message(
-      "Delta bootstrap: ",
-      nrow(new_rows),
-      " current row version(s) not represented in retained historic checkpoints; ",
-      "their full rows are already preserved in the delta baseline."
+      "Targeted delta bootstrap: ",
+      nrow(target_rows),
+      " target-area row version(s) are represented in the baseline."
     )
   } else {
-    append_csv_utf8(new_rows, ROW_VERSION_DAILY)
-    row_versions_written_rel <- ROW_VERSION_DAILY_REL
+    write_csv_gz_utf8(target_rows, TARGET_ROW_VERSION_FILE)
+    row_versions_written_rel <- TARGET_ROW_VERSION_REL
 
     message(
-      "Appended ",
-      nrow(new_rows),
-      " previously unseen row version(s) to ",
-      ROW_VERSION_DAILY_REL
+      "Archived ",
+      nrow(target_rows),
+      " previously unseen target-area row version(s) to ",
+      TARGET_ROW_VERSION_REL
     )
   }
 }
 
+message(
+  "Targeted delta scope: ",
+  paste(TARGET_AREAS, collapse = ", ")
+)
+message(
+  "Candidate unseen nationwide row versions: ",
+  nrow(candidate_rows)
+)
+message(
+  "Target-area row versions archived: ",
+  nrow(target_rows)
+)
+message(
+  "Non-target unseen row versions intentionally not archived: ",
+  non_target_new_versions_skipped_n
+)
+
 # ------------------------------------------------------------
-# 11. Append newly represented versions to row-version index
+# 11. Append archived target versions to row-version index
 # ------------------------------------------------------------
 
 new_index_rows <- empty_row_version_index()
 
-if (nrow(new_rows) > 0L) {
+if (nrow(target_rows) > 0L) {
   new_index_rows <- data.frame(
-    row_hash = as.character(new_rows$row_hash),
-    observation_key_hash = as.character(new_rows$observation_key_hash),
+    row_hash = as.character(target_rows$row_hash),
+    observation_key_hash = as.character(target_rows$observation_key_hash),
     first_archived_at = collected_at_text,
     first_snapshot_md5 = snapshot_md5,
     first_collection_key = collection_key,
     archive_origin = if (delta_bootstrap) {
       "delta_baseline"
     } else {
-      "row_version_delta"
+      "targeted_row_version_delta"
     },
     row_versions_file = row_versions_written_rel,
     stringsAsFactors = FALSE
@@ -818,14 +902,14 @@ if (index_missing) {
   message(
     "Initialized row-version index with ",
     nrow(combined_index),
-    " unique row version(s)."
+    " archived row version(s)."
   )
 } else if (nrow(new_index_rows) > 0L) {
   append_csv_utf8(new_index_rows, ROW_VERSION_INDEX)
   message(
     "Extended row-version index by ",
     nrow(new_index_rows),
-    " row version(s)."
+    " target-area row version(s)."
   )
 }
 
@@ -835,111 +919,22 @@ known_row_versions_after <- length(unique(c(
 )))
 
 # ------------------------------------------------------------
-# 12. Row-membership changes between successive source states
+# 12. Nationwide membership counts only; no detailed event archive
 # ------------------------------------------------------------
-
-previous_membership <- read_csv_if_exists(LATEST_MEMBERSHIP_FILE)
-
-if (is.null(previous_membership)) {
-  previous_membership <- data.frame(
-    row_hash = character(),
-    observation_key_hash = character(),
-    stringsAsFactors = FALSE
-  )
-  membership_bootstrap <- TRUE
-} else {
-  previous_membership <- clean_hash_table(previous_membership)
-  membership_bootstrap <- FALSE
-}
-
-membership_events <- data.frame(
-  collected_at = character(),
-  snapshot_md5 = character(),
-  collection_key = character(),
-  event_type = character(),
-  row_hash = character(),
-  observation_key_hash = character(),
-  version_status = character(),
-  stringsAsFactors = FALSE
-)
 
 membership_added_n <- 0L
 membership_removed_n <- 0L
 
 if (!membership_bootstrap && snapshot_changed) {
-  added_hashes <- setdiff(
+  membership_added_n <- length(setdiff(
     current_membership$row_hash,
     previous_membership$row_hash
-  )
-  removed_hashes <- setdiff(
+  ))
+
+  membership_removed_n <- length(setdiff(
     previous_membership$row_hash,
     current_membership$row_hash
-  )
-
-  membership_added_n <- length(added_hashes)
-  membership_removed_n <- length(removed_hashes)
-
-  if (membership_added_n > 0L) {
-    added <- current_membership[
-      match(added_hashes, current_membership$row_hash),
-      ,
-      drop = FALSE
-    ]
-
-    added_events <- data.frame(
-      collected_at = collected_at_text,
-      snapshot_md5 = snapshot_md5,
-      collection_key = collection_key,
-      event_type = "added_to_current_state",
-      row_hash = added$row_hash,
-      observation_key_hash = added$observation_key_hash,
-      version_status = ifelse(
-        added$row_hash %in% known_row_hashes_before,
-        "reappeared_known_version",
-        "new_row_version"
-      ),
-      stringsAsFactors = FALSE
-    )
-
-    membership_events <- rbind(membership_events, added_events)
-  }
-
-  if (membership_removed_n > 0L) {
-    removed <- previous_membership[
-      match(removed_hashes, previous_membership$row_hash),
-      ,
-      drop = FALSE
-    ]
-
-    removed_events <- data.frame(
-      collected_at = collected_at_text,
-      snapshot_md5 = snapshot_md5,
-      collection_key = collection_key,
-      event_type = "removed_from_current_state",
-      row_hash = removed$row_hash,
-      observation_key_hash = removed$observation_key_hash,
-      version_status = "known_version_removed",
-      stringsAsFactors = FALSE
-    )
-
-    membership_events <- rbind(membership_events, removed_events)
-  }
-}
-
-membership_events_written_rel <- ""
-
-if (nrow(membership_events) > 0L) {
-  append_csv_utf8(membership_events, MEMBERSHIP_DAILY)
-  membership_events_written_rel <- MEMBERSHIP_DAILY_REL
-
-  message(
-    "Appended ",
-    nrow(membership_events),
-    " membership event(s): added=",
-    membership_added_n,
-    "; removed=",
-    membership_removed_n
-  )
+  ))
 }
 
 if (membership_bootstrap || snapshot_changed) {
@@ -956,7 +951,12 @@ if (membership_bootstrap || snapshot_changed) {
       " row version(s)."
     )
   } else {
-    message("Updated latest row-membership state.")
+    message(
+      "Updated latest row-membership state; nationwide membership counts: +",
+      membership_added_n,
+      " / -",
+      membership_removed_n
+    )
   }
 }
 
@@ -1069,7 +1069,8 @@ if (!snapshot_changed) {
   } else {
     message(
       "Changed CNEMC snapshot recorded without another full checkpoint; ",
-      "row-version deltas and membership events preserve scientific changes."
+      "target-area deltas preserve high-frequency research rows while ",
+      "nationwide membership changes are retained as counts only."
     )
   }
 
@@ -1102,7 +1103,7 @@ if (!snapshot_changed) {
 }
 
 # ------------------------------------------------------------
-# 15. Append row-delta manifest for bootstrap or changed state
+# 15. Append targeted row-delta manifest
 # ------------------------------------------------------------
 
 if (delta_bootstrap || snapshot_changed) {
@@ -1112,21 +1113,24 @@ if (delta_bootstrap || snapshot_changed) {
     snapshot_md5 = snapshot_md5,
     retention_bucket = retention_bucket,
     delta_bootstrap = delta_bootstrap,
+    target_areas = paste(TARGET_AREAS, collapse = ";"),
     historic_index_seeded = historic_seed_n,
-    new_row_versions = nrow(new_rows),
-    new_observation_keys = new_observation_keys_n,
-    revised_row_versions = revised_row_versions_n,
-    membership_added = membership_added_n,
-    membership_removed = membership_removed_n,
-    known_row_versions_after = known_row_versions_after,
+    current_unique_rows = nrow(current_unique),
+    candidate_unseen_nationwide_versions = nrow(candidate_rows),
+    archived_target_row_versions = nrow(target_rows),
+    target_new_observation_keys = target_new_observation_keys_n,
+    target_revised_row_versions = target_revised_row_versions_n,
+    non_target_unseen_versions_skipped = non_target_new_versions_skipped_n,
+    membership_added_count = membership_added_n,
+    membership_removed_count = membership_removed_n,
+    known_archived_row_versions_after = known_row_versions_after,
     baseline_file = baseline_relative_path,
     row_versions_file = row_versions_written_rel,
-    membership_events_file = membership_events_written_rel,
     stringsAsFactors = FALSE
   )
 
   append_csv_utf8(delta_entry, DELTA_MANIFEST)
-  message("Updated row-delta manifest: ", DELTA_MANIFEST)
+  message("Updated targeted row-delta manifest: ", DELTA_MANIFEST)
 }
 
 # ------------------------------------------------------------
@@ -1140,11 +1144,16 @@ message("Full checkpoint retained: ", retain_full_checkpoint)
 message("Retention bucket: ", retention_bucket)
 message("Delta bootstrap: ", delta_bootstrap)
 message("Historic row versions seeded: ", historic_seed_n)
-message("New row versions archived this run: ", nrow(new_rows))
-message("  New observation keys: ", new_observation_keys_n)
-message("  Revised observation versions: ", revised_row_versions_n)
-message("Membership events: +", membership_added_n, " / -", membership_removed_n)
 message("Known row versions after run: ", known_row_versions_after)
 message("Collection manifest: ", COLLECTION_MANIFEST)
-message("Delta manifest: ", DELTA_MANIFEST)
+message("Targeted delta areas: ", paste(TARGET_AREAS, collapse = ", "))
+message("Target-area row versions archived this run: ", nrow(target_rows))
+message("  Target new observation keys: ", target_new_observation_keys_n)
+message("  Target revised row versions: ", target_revised_row_versions_n)
+message(
+  "  Non-target unseen versions skipped: ",
+  non_target_new_versions_skipped_n
+)
+message("Nationwide membership counts: +", membership_added_n, " / -", membership_removed_n)
+message("Targeted delta manifest: ", DELTA_MANIFEST)
 message("Backup repository: ", BACKUP_REPO)
