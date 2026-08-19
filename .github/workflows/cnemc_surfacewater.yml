@@ -18,6 +18,11 @@ jobs:
   backup-cnemc:
     runs-on: ubuntu-24.04
 
+    # Runs are scheduled every 20 minutes.
+    # Do not allow an unhealthy runner or network step to block
+    # multiple subsequent collection windows.
+    timeout-minutes: 18
+
     env:
       TZ: Asia/Taipei
       TELITI_TIMEZONE: Asia/Taipei
@@ -28,9 +33,11 @@ jobs:
     steps:
       - name: Check out scraper repository
         uses: actions/checkout@v7
+        timeout-minutes: 3
 
       - name: Check out private data backup repository
         uses: actions/checkout@v7
+        timeout-minutes: 3
         with:
           repository: aynuddin0587/teliti-data-backup
           ref: main
@@ -39,30 +46,81 @@ jobs:
           persist-credentials: true
           fetch-depth: 20
 
+      # GitHub's Ubuntu runner image normally prioritizes
+      # azure.archive.ubuntu.com through /etc/apt/apt-mirrors.txt.
+      #
+      # We have observed multi-hour stalls against that mirror.
+      # For this high-frequency collector, use the public Ubuntu
+      # mirrors directly before setup-r invokes apt-get update.
+      - name: Stabilize Ubuntu package mirrors
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Original Ubuntu apt mirror configuration:"
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            cat /etc/apt/apt-mirrors.txt
+          else
+            echo "/etc/apt/apt-mirrors.txt not found"
+          fi
+
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            printf "https://archive.ubuntu.com/ubuntu/\tpriority:1\n" \
+              | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+
+            printf "https://security.ubuntu.com/ubuntu/\tpriority:2\n" \
+              | sudo tee -a /etc/apt/apt-mirrors.txt > /dev/null
+          fi
+
+          echo
+          echo "Teliti Ubuntu apt mirror configuration:"
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            cat /etc/apt/apt-mirrors.txt
+          fi
+
       - name: Set up R
         uses: r-lib/actions/setup-r@v2
+        timeout-minutes: 8
         with:
           r-version: "4.6.1"
           use-public-rspm: true
 
       - name: Restore R environment
         uses: r-lib/actions/setup-renv@v2
+        timeout-minutes: 8
 
       - name: Run CNEMC surface-water scraper
+        timeout-minutes: 6
         run: |
+          echo "CNEMC scraper started:"
+          date --iso-8601=seconds
+
           Rscript nmemc/script/02_nmemc_surfacewater_archive.R
 
+          echo "CNEMC scraper finished:"
+          date --iso-8601=seconds
+
       - name: Prepare persistent CNEMC backup
+        timeout-minutes: 5
         run: |
+          echo "Backup preparation started:"
+          date --iso-8601=seconds
+
           Rscript .github/scripts/prepare_cnemc_backup.R
 
+          echo "Backup preparation finished:"
+          date --iso-8601=seconds
+
       - name: Show backup repository changes
+        timeout-minutes: 2
         working-directory: teliti-data-backup
         run: |
           echo "Candidate CNEMC backup changes:"
           git status --short
 
       - name: Commit and push CNEMC backup safely
+        timeout-minutes: 5
         run: |
           bash .github/scripts/push_backup_with_retry.sh \
             "${TELITI_BACKUP_REPO}" \
@@ -70,13 +128,15 @@ jobs:
             "Update CNEMC surface-water backup"
 
       - name: Show final backup status
+        timeout-minutes: 2
         working-directory: teliti-data-backup
         run: |
           git status
           git log --oneline -5
 
       - name: Upload diagnostics if workflow fails
-        if: failure()
+        if: ${{ failure() || cancelled() }}
+        timeout-minutes: 3
         uses: actions/upload-artifact@v7
         with:
           name: cnemc-backup-failure-${{ github.run_id }}
