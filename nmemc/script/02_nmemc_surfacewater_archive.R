@@ -103,6 +103,21 @@ MN_NAME  <- as.character(getOption("nmemc.surfacewater.mn_name", ""))
 PAGE_DELAY_SECONDS <- suppressWarnings(as.numeric(getOption("nmemc.surfacewater.page_delay", 0.25)))
 if (is.na(PAGE_DELAY_SECONDS) || PAGE_DELAY_SECONDS < 0) PAGE_DELAY_SECONDS <- 0.25
 
+# HTTP-level retries do not catch a structurally valid HTTP 200 response whose
+# nationwide table is temporarily empty (observed during source rollover).
+# Retry the complete fetch+parse transaction separately for that semantic case.
+SNAPSHOT_MAX_ATTEMPTS <- suppressWarnings(as.integer(
+  getOption("nmemc.surfacewater.snapshot_max_attempts", 3L)
+))
+if (is.na(SNAPSHOT_MAX_ATTEMPTS) || SNAPSHOT_MAX_ATTEMPTS < 1L) SNAPSHOT_MAX_ATTEMPTS <- 3L
+
+SNAPSHOT_RETRY_SECONDS <- suppressWarnings(as.numeric(
+  getOption("nmemc.surfacewater.snapshot_retry_seconds", c(20, 60))
+))
+SNAPSHOT_RETRY_SECONDS <- SNAPSHOT_RETRY_SECONDS[
+  is.finite(SNAPSHOT_RETRY_SECONDS) & SNAPSHOT_RETRY_SECONDS >= 0
+]
+
 sprintf(
   "nmemc_surfacewater_%s.log",
   format(Sys.time(), "%Y%m%d", tz = COLLECTOR_TZ)
@@ -537,6 +552,17 @@ parse_snapshot <- function(bundle) {
 
   dat <- dplyr::bind_rows(page_frames)
 
+  # A nationwide request should never become a canonical snapshot when the API
+  # reports success but supplies zero data rows. Treat this as a transient
+  # semantic source failure so collect_valid_snapshot() can retry the full run.
+  if (nrow(dat) == 0L) {
+    stop(
+      "CNEMC API returned a successful response with zero data rows; ",
+      "treating this as a transient invalid snapshot",
+      call. = FALSE
+    )
+  }
+
   # Ensure all source columns are character even if JSON simplification varies.
   source_cols <- dictionary$standardized_name
   dat <- dat |>
@@ -574,6 +600,66 @@ dat$scraper_code_commit <- if (nzchar(GITHUB_SHA)) {
 }
 
   list(data = tibble::as_tibble(dat), dictionary = dictionary)
+}
+
+collect_valid_snapshot <- function() {
+  last_error <- NULL
+
+  for (attempt in seq_len(SNAPSHOT_MAX_ATTEMPTS)) {
+    if (attempt > 1L) {
+      delay_index <- min(attempt - 1L, length(SNAPSHOT_RETRY_SECONDS))
+      delay <- if (length(SNAPSHOT_RETRY_SECONDS) > 0L) {
+        SNAPSHOT_RETRY_SECONDS[[delay_index]]
+      } else {
+        0
+      }
+
+      if (is.finite(delay) && delay > 0) {
+        log_msg(
+          "Retrying full CNEMC snapshot transaction after ", delay,
+          " second(s); attempt ", attempt, "/", SNAPSHOT_MAX_ATTEMPTS
+        )
+        Sys.sleep(delay)
+      } else {
+        log_msg(
+          "Retrying full CNEMC snapshot transaction immediately; attempt ",
+          attempt, "/", SNAPSHOT_MAX_ATTEMPTS
+        )
+      }
+    }
+
+    attempt_result <- tryCatch(
+      {
+        bundle <- fetch_snapshot()
+        parsed <- parse_snapshot(bundle)
+
+        log_msg(
+          "Validated CNEMC snapshot: rows=", nrow(parsed$data),
+          "; pages=", bundle$total_pages,
+          "; attempt=", attempt, "/", SNAPSHOT_MAX_ATTEMPTS
+        )
+
+        list(ok = TRUE, bundle = bundle, parsed = parsed, error = NULL)
+      },
+      error = function(e) {
+        list(ok = FALSE, bundle = NULL, parsed = NULL, error = e)
+      }
+    )
+
+    if (isTRUE(attempt_result$ok)) return(attempt_result)
+
+    last_error <- attempt_result$error
+    log_msg(
+      "WARNING CNEMC snapshot attempt ", attempt, "/", SNAPSHOT_MAX_ATTEMPTS,
+      " failed: ", conditionMessage(last_error)
+    )
+  }
+
+  stop(
+    "CNEMC snapshot failed after ", SNAPSHOT_MAX_ATTEMPTS,
+    " full attempt(s): ", conditionMessage(last_error),
+    call. = FALSE
+  )
 }
 
 # -----------------------------
@@ -784,16 +870,21 @@ scraper_code_commit = if (nzchar(GITHUB_SHA)) GITHUB_SHA else NA_character_,
 log_msg("START CNEMC surface-water archive")
 log_msg("Source page: ", MAIN_URL)
 
-bundle <- tryCatch(
-  fetch_snapshot(),
+collection <- tryCatch(
+  collect_valid_snapshot(),
   error = function(e) {
-    log_msg("FATAL data fetch error: ", conditionMessage(e))
+    log_msg("FATAL CNEMC collection error: ", conditionMessage(e))
     stop(e)
   }
 )
 
+bundle <- collection$bundle
+parsed <- collection$parsed
+
+# Archive only after fetch + parse + zero-row validation have succeeded.
+# This prevents transient empty/invalid responses from becoming canonical raw
+# snapshots or replacing the current source bundle.
 changed <- archive_snapshot_if_changed(bundle)
-parsed <- parse_snapshot(bundle)
 write_current_outputs(parsed)
 update_cumulative_master(
   parsed$data,

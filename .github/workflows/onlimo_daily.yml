@@ -17,6 +17,7 @@ concurrency:
 jobs:
   backup-onlimo-daily:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
 
     env:
       TZ: Asia/Taipei
@@ -28,9 +29,11 @@ jobs:
     steps:
       - name: Check out scraper repository
         uses: actions/checkout@v7
+        timeout-minutes: 3
 
       - name: Check out private data backup repository
         uses: actions/checkout@v7
+        timeout-minutes: 3
         with:
           repository: aynuddin0587/teliti-data-backup
           ref: main
@@ -40,44 +43,60 @@ jobs:
           fetch-depth: 20
 
       - name: Restore ONLIMO recovery state
+        timeout-minutes: 2
         run: |
           mkdir -p run-data/onlimo/data
-
           if [ -f teliti-data-backup/onlimo_daily/state/station_state.csv ]; then
             cp \
               teliti-data-backup/onlimo_daily/state/station_state.csv \
               run-data/onlimo/data/onlimo_daily_station_state.csv
-
             echo "Restored persistent ONLIMO station state."
           else
             echo "No persistent ONLIMO station state exists yet."
             echo "This will be the first GitHub ONLIMO daily collection."
           fi
 
+      - name: Stabilize Ubuntu apt network
+        timeout-minutes: 2
+        run: |
+          bash .github/scripts/stabilize_ubuntu_apt.sh
+
       - name: Set up R
         uses: r-lib/actions/setup-r@v2
+        timeout-minutes: 8
         with:
           r-version: "4.6.1"
           use-public-rspm: true
 
       - name: Restore R environment
         uses: r-lib/actions/setup-renv@v2
+        timeout-minutes: 10
 
       - name: Run ONLIMO daily scraper
+        timeout-minutes: 15
         run: |
+          echo "ONLIMO daily scraper started:"
+          date --iso-8601=seconds
+
           Rscript onlimo/script/01_onlimo_daily_archive.R
 
+          echo "ONLIMO daily scraper finished:"
+          date --iso-8601=seconds
+
       - name: Prepare persistent ONLIMO backup
+        timeout-minutes: 5
         run: |
           Rscript .github/scripts/prepare_onlimo_daily_backup.R
 
       - name: Show backup repository changes
+        timeout-minutes: 2
         working-directory: teliti-data-backup
         run: |
           echo "Candidate ONLIMO backup changes:"
           git status --short
 
       - name: Commit and push ONLIMO backup safely
+        timeout-minutes: 5
         run: |
           bash .github/scripts/push_backup_with_retry.sh \
             "${TELITI_BACKUP_REPO}" \
@@ -85,13 +104,15 @@ jobs:
             "Update ONLIMO daily backup"
 
       - name: Show final backup status
+        timeout-minutes: 2
         working-directory: teliti-data-backup
         run: |
           git status
           git log --oneline -5
 
-      - name: Upload diagnostics if workflow fails
-        if: failure()
+      - name: Upload diagnostics if workflow fails or is cancelled
+        if: ${{ failure() || cancelled() }}
+        timeout-minutes: 3
         uses: actions/upload-artifact@v7
         with:
           name: onlimo-daily-failure-${{ github.run_id }}
