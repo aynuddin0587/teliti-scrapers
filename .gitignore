@@ -79,6 +79,7 @@
 # ------------------------------------------------------------
 !/teliti_reconciliation/
 /teliti_reconciliation/output/**
+/teliti_reconciliation/analysis/**
 !/teliti_reconciliation/script/
 !/teliti_reconciliation/script/**
 !/teliti_reconciliation/registry/
