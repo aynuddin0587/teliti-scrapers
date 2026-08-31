@@ -33,6 +33,10 @@ options(stringsAsFactors = FALSE)
 # -----------------------------------------------------------------------------
 PROJECT_DIR <- "D:/# R Project/penelitian"
 ANALYSIS_DIR <- file.path(PROJECT_DIR, "teliti_reconciliation", "analysis")
+STATION_METADATA_FILE <- file.path(
+  ANALYSIS_DIR,
+  "station_metadata.rds"
+)
 OUTPUT_DIR <- file.path(PROJECT_DIR, "teliti_reconciliation", "output", "data_inventory")
 
 dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
@@ -341,6 +345,7 @@ if (length(missing_files) > 0L) {
 
 log_msg("Reading canonical scientific datasets ...")
 data_list <- lapply(DATASET_FILES, readRDS)
+station_metadata <- safe_read_rds(STATION_METADATA_FILE)
 cnemc_history <- safe_read_rds(CNEMC_HISTORY_FILE)
 canonical_inventory <- safe_read_csv(DATASET_INVENTORY_FILE)
 
@@ -395,36 +400,101 @@ get_coord_columns <- function(dataset, df) {
 }
 
 get_date_range <- function(dataset, df) {
-  # Prefer true parsed date/datetime fields.
+
+  # --------------------------------------------------------------------------
+  # Fujian weekly
+  # Use source year as the reliable beginning of the archive, but retain the
+  # actual latest weekly report date for the current/latest year.
+  # --------------------------------------------------------------------------
+  if (dataset == "Fujian weekly" && "year" %in% names(df)) {
+
+    yr <- suppressWarnings(as.integer(df$year))
+    yr <- yr[is.finite(yr) & yr >= 1900 & yr <= 2200]
+
+    if (length(yr) > 0L) {
+      min_year <- min(yr)
+      max_year <- max(yr)
+
+      start_date <- as.Date(
+        sprintf("%04d-01-01", min_year),
+        format = "%Y-%m-%d"
+      )
+
+      end_date <- as.Date(
+        sprintf("%04d-01-01", max_year),
+        format = "%Y-%m-%d"
+      )
+
+      if ("report_period_end" %in% names(df)) {
+        d <- parse_date_flexible(df$report_period_end)
+        source_year <- suppressWarnings(as.integer(df$year))
+
+        # Only accept dates reasonably belonging to the latest source year.
+        keep <- !is.na(d) &
+          !is.na(source_year) &
+          source_year == max_year &
+          d >= as.Date(sprintf("%04d-01-01", max_year)) &
+          d <= as.Date(sprintf("%04d-01-15", max_year + 1L))
+
+        if (any(keep)) {
+          end_date <- max(d[keep])
+        }
+      }
+
+      return(c(start_date, end_date))
+    }
+  }
+
+  # --------------------------------------------------------------------------
+  # NMEMC marine
+  # The source is fundamentally annual here. Plot years as year anchors;
+  # do not invent December 31 as an observed date.
+  # --------------------------------------------------------------------------
+  if (dataset == "NMEMC marine") {
+
+    year_col <- first_existing_col(
+      df,
+      c("source_year", "year")
+    )
+
+    if (!is.na(year_col)) {
+      yr <- suppressWarnings(as.integer(df[[year_col]]))
+      yr <- yr[is.finite(yr) & yr >= 1900 & yr <= 2200]
+
+      if (length(yr) > 0L) {
+        return(c(
+          as.Date(sprintf("%04d-01-01", min(yr))),
+          as.Date(sprintf("%04d-01-01", max(yr)))
+        ))
+      }
+    }
+  }
+
+  # --------------------------------------------------------------------------
+  # Datasets with genuine observation dates
+  # --------------------------------------------------------------------------
   candidates <- switch(
     dataset,
-    "Fujian weekly" = c("report_period_end", "report_period_start"),
-    "NMEMC marine" = c("monitor_date", "sample_date", "date", "monitor_time_raw"),
-    "CNEMC surface water" = c("observation_datetime", "monitoring_datetime", "collected_at"),
-    "ONLIMO daily" = c("date"),
-    "ONLIMO historical IP" = c("date"),
+    "CNEMC surface water" =
+      c("observation_datetime", "monitoring_datetime", "collected_at"),
+
+    "ONLIMO daily" =
+      c("date"),
+
+    "ONLIMO historical IP" =
+      c("date"),
+
     character()
   )
 
   for (nm in candidates) {
     if (!nm %in% names(df)) next
+
     d <- parse_date_flexible(df[[nm]])
     d <- d[!is.na(d)]
-    if (length(d) > 0L) return(c(min(d), max(d)))
-  }
 
-  # NMEMC canonical rows always carry source_year even if the native monitoring
-  # month string cannot be parsed consistently. Use year bounds conservatively.
-  year_candidates <- c("source_year", "year")
-  for (nm in year_candidates) {
-    if (!nm %in% names(df)) next
-    yr <- suppressWarnings(as.integer(df[[nm]]))
-    yr <- yr[is.finite(yr) & yr >= 1900 & yr <= 2200]
-    if (length(yr) > 0L) {
-      return(c(
-        as.Date(sprintf("%04d-01-01", min(yr)), format = "%Y-%m-%d"),
-        as.Date(sprintf("%04d-12-31", max(yr)), format = "%Y-%m-%d")
-      ))
+    if (length(d) > 0L) {
+      return(c(min(d), max(d)))
     }
   }
 

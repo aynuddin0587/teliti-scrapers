@@ -541,19 +541,80 @@ standardize_fujian_year <- function(raw_df, year, meta, source_filename) {
 }
 
 find_fujian_crosswalk <- function() {
-  candidates <- c(
-    file.path(FUJIAN_LOCAL_PROCESSED, "fujian_station_crosswalk.csv"),
-    file.path(PROJECT_DIR, "fujian_surfacewater", "data", "fujian_station_crosswalk.csv"),
-    file.path(PROJECT_DIR, "fujian_surfacewater", "fujian_station_crosswalk.csv")
-  )
-  direct <- first_existing(candidates)
-  if (!is.na(direct)) return(direct)
+  root <- file.path(PROJECT_DIR, "fujian_surfacewater")
 
-  all <- find_recursive(
-    file.path(PROJECT_DIR, "fujian_surfacewater"),
-    "^fujian_station_crosswalk\\.csv$"
+  candidates <- unique(c(
+    file.path(FUJIAN_LOCAL_PROCESSED, "fujian_station_crosswalk.csv"),
+    file.path(root, "data", "fujian_station_crosswalk.csv"),
+    file.path(root, "fujian_station_crosswalk.csv"),
+    find_recursive(root, "^fujian_station_crosswalk\\.csv$")
+  ))
+
+  candidates <- candidates[file.exists(candidates)]
+
+  if (length(candidates) == 0L) {
+    msg("No Fujian station crosswalk found.")
+    return(NA_character_)
+  }
+
+  scored <- lapply(candidates, function(path) {
+    cw <- safe_read_csv(path)
+
+    if (is.null(cw) || nrow(cw) == 0L) {
+      return(tibble(
+        path = path,
+        rows = 0L,
+        valid_coordinates = 0L
+      ))
+    }
+
+    lon_col <- find_coord_col_flexible(cw, "lon")
+    lat_col <- find_coord_col_flexible(cw, "lat")
+
+    if (is.na(lon_col) || is.na(lat_col)) {
+      return(tibble(
+        path = path,
+        rows = nrow(cw),
+        valid_coordinates = 0L
+      ))
+    }
+
+    lon <- suppressWarnings(
+      readr::parse_number(as.character(cw[[lon_col]]))
+    )
+    lat <- suppressWarnings(
+      readr::parse_number(as.character(cw[[lat_col]]))
+    )
+
+    tibble(
+      path = path,
+      rows = nrow(cw),
+      valid_coordinates = sum(valid_lonlat(lon, lat), na.rm = TRUE)
+    )
+  }) %>%
+    bind_rows() %>%
+    arrange(desc(valid_coordinates), desc(rows))
+
+  best <- scored %>% slice(1)
+
+  msg(
+    "Fujian crosswalk selected: ", best$path,
+    " | rows=", best$rows,
+    " | valid coordinates=", best$valid_coordinates
   )
-  if (length(all) == 0L) NA_character_ else all[[1]]
+
+  if (best$valid_coordinates == 0L) {
+    cw <- safe_read_csv(best$path)
+    msg(
+      "WARNING: selected Fujian crosswalk contains no recognized coordinates."
+    )
+    msg(
+      "Crosswalk columns: ",
+      paste(names(cw), collapse = ", ")
+    )
+  }
+
+  best$path[[1]]
 }
 
 build_fujian_crosswalk_lookup <- function(path) {
