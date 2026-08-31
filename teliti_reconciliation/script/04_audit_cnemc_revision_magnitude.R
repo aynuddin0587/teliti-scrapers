@@ -1,27 +1,12 @@
-# Teliti CNEMC revision-magnitude audit
+# CNEMC revision-magnitude audit - outage-aware
 #
 # Purpose:
-#   Quantify how large substantive CNEMC revisions are after the field-level
-#   audit has identified which scientific variables changed between a retained
-#   GitHub row version and the closest PC row version for the same observation
-#   key.
+#   Quantify substantive CNEMC revisions while separating revisions captured
+#   during strict common operation from revisions captured during asymmetric
+#   coverage / PC outages.
 #
-# Inputs:
-#   teliti_reconciliation/output/cnemc/
-#     - cnemc_revision_field_differences.csv.gz
-#     - cnemc_github_only_observation_keys.csv
-#
-# Outputs:
-#   - cnemc_revision_magnitude_details.csv.gz
-#   - cnemc_revision_magnitude_summary.csv
-#   - cnemc_revision_class_transitions.csv
-#   - cnemc_revision_magnitude_audit.md
-#
-# Notes:
-#   - Magnitudes are summarized within fields only; units differ among fields.
-#   - Raw-value qualifiers such as <, >, <= and >= are retained and flagged.
-#   - The paired PC version is inherited from 03_audit_cnemc_revision_fields.R,
-#     where "closest" means the fewest differing selected scientific fields.
+# Existing outputs are preserved. New output:
+#   - cnemc_revision_magnitude_summary_by_scope.csv
 
 suppressPackageStartupMessages({
   library(dplyr)
@@ -29,6 +14,9 @@ suppressPackageStartupMessages({
   library(tibble)
 })
 
+# -----------------------------------------------------------------------------
+# 1. Configuration
+# -----------------------------------------------------------------------------
 PRIMARY_ROOT <- Sys.getenv(
   "TELITI_PRIMARY_ROOT",
   unset = "D:/# R Project/penelitian"
@@ -46,7 +34,6 @@ FIELD_DIFF_PATH <- file.path(
   OUTPUT_DIR,
   "cnemc_revision_field_differences.csv.gz"
 )
-
 GITHUB_ONLY_PATH <- file.path(
   OUTPUT_DIR,
   "cnemc_github_only_observation_keys.csv"
@@ -56,22 +43,26 @@ DETAIL_PATH <- file.path(
   OUTPUT_DIR,
   "cnemc_revision_magnitude_details.csv.gz"
 )
-
 SUMMARY_PATH <- file.path(
   OUTPUT_DIR,
   "cnemc_revision_magnitude_summary.csv"
 )
-
+SUMMARY_SCOPE_PATH <- file.path(
+  OUTPUT_DIR,
+  "cnemc_revision_magnitude_summary_by_scope.csv"
+)
 CLASS_TRANSITION_PATH <- file.path(
   OUTPUT_DIR,
   "cnemc_revision_class_transitions.csv"
 )
-
 REPORT_PATH <- file.path(
   OUTPUT_DIR,
   "cnemc_revision_magnitude_audit.md"
 )
 
+# -----------------------------------------------------------------------------
+# 2. Helpers
+# -----------------------------------------------------------------------------
 assert_file <- function(path, label) {
   if (!file.exists(path)) stop(label, " not found: ", path)
 }
@@ -130,7 +121,85 @@ extract_numeric <- function(x) {
 safe_quantile <- function(x, prob) {
   x <- x[is.finite(x)]
   if (length(x) == 0L) return(NA_real_)
-  as.numeric(stats::quantile(x, probs = prob, na.rm = TRUE, names = FALSE, type = 7))
+  as.numeric(
+    stats::quantile(
+      x,
+      probs = prob,
+      na.rm = TRUE,
+      names = FALSE,
+      type = 7
+    )
+  )
+}
+
+summarize_magnitude <- function(dat, scope_label = NULL) {
+  if (nrow(dat) == 0L) {
+    out <- tibble(
+      differing_field = character(),
+      difference_records = integer(),
+      unique_observation_keys = integer(),
+      numeric_pairs = integer(),
+      qualifier_changes = integer(),
+      github_higher = integer(),
+      github_lower = integer(),
+      same_numeric_value = integer(),
+      median_absolute_change = numeric(),
+      p90_absolute_change = numeric(),
+      max_absolute_change = numeric(),
+      median_absolute_pct_change = numeric(),
+      p90_absolute_pct_change = numeric(),
+      max_absolute_pct_change = numeric()
+    )
+    if (!is.null(scope_label)) {
+      out <- out %>% mutate(coverage_scope = character(), .before = 1)
+    }
+    return(out)
+  }
+
+  out <- dat %>%
+    filter(numeric_field) %>%
+    group_by(differing_field) %>%
+    summarise(
+      difference_records = n(),
+      unique_observation_keys = n_distinct(observation_key_hash),
+      numeric_pairs = sum(numeric_pair_available, na.rm = TRUE),
+      qualifier_changes = sum(qualifier_changed %in% TRUE, na.rm = TRUE),
+      github_higher = sum(change_direction == "github_higher", na.rm = TRUE),
+      github_lower = sum(change_direction == "github_lower", na.rm = TRUE),
+      same_numeric_value = sum(change_direction == "same_numeric_value", na.rm = TRUE),
+      median_absolute_change = if (any(numeric_pair_available)) {
+        stats::median(absolute_change[numeric_pair_available], na.rm = TRUE)
+      } else {
+        NA_real_
+      },
+      p90_absolute_change = safe_quantile(
+        absolute_change[numeric_pair_available],
+        0.90
+      ),
+      max_absolute_change = if (any(numeric_pair_available)) {
+        max(absolute_change[numeric_pair_available], na.rm = TRUE)
+      } else {
+        NA_real_
+      },
+      median_absolute_pct_change = if (any(is.finite(absolute_pct_change))) {
+        stats::median(absolute_pct_change, na.rm = TRUE)
+      } else {
+        NA_real_
+      },
+      p90_absolute_pct_change = safe_quantile(absolute_pct_change, 0.90),
+      max_absolute_pct_change = if (any(is.finite(absolute_pct_change))) {
+        max(absolute_pct_change, na.rm = TRUE)
+      } else {
+        NA_real_
+      },
+      .groups = "drop"
+    ) %>%
+    arrange(desc(unique_observation_keys), differing_field)
+
+  if (!is.null(scope_label)) {
+    out <- out %>% mutate(coverage_scope = scope_label, .before = 1)
+  }
+  out
 }
 
 numeric_fields <- c(
@@ -148,6 +217,9 @@ numeric_fields <- c(
   "algal_density_raw"
 )
 
+# -----------------------------------------------------------------------------
+# 3. Read field-level revision audit
+# -----------------------------------------------------------------------------
 assert_file(FIELD_DIFF_PATH, "CNEMC revision field differences")
 
 field_diff <- readr::read_csv(
@@ -156,9 +228,18 @@ field_diff <- readr::read_csv(
   progress = FALSE
 )
 
+if (!"coverage_scope" %in% names(field_diff)) {
+  warning(
+    "Field-difference file has no coverage_scope column. Run outage-aware ",
+    "scripts 02 and 03 first. Treating rows as unclassified."
+  )
+  field_diff$coverage_scope <- "unclassified_all_archive"
+}
+
 assert_columns(
   field_diff,
   c(
+    "coverage_scope",
     "observation_key_hash",
     "github_row_hash",
     "closest_pc_row_hash",
@@ -172,6 +253,7 @@ assert_columns(
 if (nrow(field_diff) == 0L) {
   readr::write_csv(tibble(), DETAIL_PATH)
   readr::write_csv(tibble(), SUMMARY_PATH)
+  readr::write_csv(tibble(), SUMMARY_SCOPE_PATH)
   readr::write_csv(tibble(), CLASS_TRANSITION_PATH)
   writeLines(
     c(
@@ -185,6 +267,9 @@ if (nrow(field_diff) == 0L) {
   quit(save = "no", status = 0L)
 }
 
+# -----------------------------------------------------------------------------
+# 4. Quantify revision magnitudes
+# -----------------------------------------------------------------------------
 detail <- field_diff %>%
   mutate(
     github_value = normalize_text(github_value),
@@ -242,48 +327,55 @@ detail <- field_diff %>%
 
 readr::write_csv(detail, DETAIL_PATH, na = "")
 
-summary <- detail %>%
-  filter(numeric_field) %>%
-  group_by(differing_field) %>%
-  summarise(
-    difference_records = n(),
-    unique_observation_keys = n_distinct(observation_key_hash),
-    numeric_pairs = sum(numeric_pair_available, na.rm = TRUE),
-    qualifier_changes = sum(qualifier_changed %in% TRUE, na.rm = TRUE),
-    github_higher = sum(change_direction == "github_higher", na.rm = TRUE),
-    github_lower = sum(change_direction == "github_lower", na.rm = TRUE),
-    same_numeric_value = sum(change_direction == "same_numeric_value", na.rm = TRUE),
-    median_absolute_change = if (any(numeric_pair_available)) {
-      stats::median(absolute_change[numeric_pair_available], na.rm = TRUE)
-    } else {
-      NA_real_
-    },
-    p90_absolute_change = safe_quantile(absolute_change[numeric_pair_available], 0.90),
-    max_absolute_change = if (any(numeric_pair_available)) {
-      max(absolute_change[numeric_pair_available], na.rm = TRUE)
-    } else {
-      NA_real_
-    },
-    median_absolute_pct_change = if (any(is.finite(absolute_pct_change))) {
-      stats::median(absolute_pct_change, na.rm = TRUE)
-    } else {
-      NA_real_
-    },
-    p90_absolute_pct_change = safe_quantile(absolute_pct_change, 0.90),
-    max_absolute_pct_change = if (any(is.finite(absolute_pct_change))) {
-      max(absolute_pct_change, na.rm = TRUE)
-    } else {
-      NA_real_
-    },
-    .groups = "drop"
-  ) %>%
-  arrange(desc(unique_observation_keys), differing_field)
-
+# Backward-compatible all-archive summary.
+summary <- summarize_magnitude(detail)
 readr::write_csv(summary, SUMMARY_PATH, na = "")
+
+# New scope-aware summaries.
+actual_scopes <- unique(as.character(detail$coverage_scope))
+actual_scopes <- actual_scopes[!is.na(actual_scopes)]
+
+scope_parts <- lapply(
+  actual_scopes,
+  function(s) summarize_magnitude(
+    detail %>% filter(coverage_scope == s),
+    s
+  )
+)
+
+scope_parts[[length(scope_parts) + 1L]] <- summarize_magnitude(
+  detail %>% filter(coverage_scope != "strict_common_operation"),
+  "asymmetric_coverage"
+)
+scope_parts[[length(scope_parts) + 1L]] <- summarize_magnitude(
+  detail,
+  "all_archive"
+)
+
+summary_by_scope <- bind_rows(scope_parts) %>%
+  arrange(
+    factor(
+      coverage_scope,
+      levels = c(
+        "strict_common_operation",
+        "asymmetric_coverage",
+        "pc_outage",
+        "github_only_tail",
+        "github_only_head",
+        "unclassified_all_archive",
+        "all_archive"
+      )
+    ),
+    desc(unique_observation_keys),
+    differing_field
+  )
+
+readr::write_csv(summary_by_scope, SUMMARY_SCOPE_PATH, na = "")
 
 class_transitions <- detail %>%
   filter(differing_field == "water_quality_class_code") %>%
   transmute(
+    coverage_scope,
     observation_key_hash,
     github_collected_at = if ("github_collected_at" %in% names(detail)) github_collected_at else NA_character_,
     area = if ("area" %in% names(detail)) area else NA_character_,
@@ -299,97 +391,212 @@ class_transitions <- detail %>%
       ifelse(is.na(github_numeric), "NA", format(github_numeric, trim = TRUE))
     )
   ) %>%
-  arrange(github_collected_at, observation_key_hash)
+  arrange(coverage_scope, github_collected_at, observation_key_hash)
 
 readr::write_csv(class_transitions, CLASS_TRANSITION_PATH, na = "")
 
-n_revision_keys <- n_distinct(field_diff$observation_key_hash)
-n_numeric_revision_keys <- n_distinct(
-  detail$observation_key_hash[detail$numeric_field]
+# -----------------------------------------------------------------------------
+# 5. Scope counts
+# -----------------------------------------------------------------------------
+strict_keys <- n_distinct(
+  detail$observation_key_hash[
+    detail$coverage_scope == "strict_common_operation"
+  ]
 )
-n_github_only <- if (file.exists(GITHUB_ONLY_PATH)) {
+asym_keys <- n_distinct(
+  detail$observation_key_hash[
+    detail$coverage_scope != "strict_common_operation"
+  ]
+)
+all_keys <- n_distinct(detail$observation_key_hash)
+
+strict_numeric_keys <- n_distinct(
+  detail$observation_key_hash[
+    detail$coverage_scope == "strict_common_operation" & detail$numeric_field
+  ]
+)
+asym_numeric_keys <- n_distinct(
+  detail$observation_key_hash[
+    detail$coverage_scope != "strict_common_operation" & detail$numeric_field
+  ]
+)
+all_numeric_keys <- n_distinct(detail$observation_key_hash[detail$numeric_field])
+
+strict_class_n <- sum(
+  class_transitions$coverage_scope == "strict_common_operation",
+  na.rm = TRUE
+)
+asym_class_n <- sum(
+  class_transitions$coverage_scope != "strict_common_operation",
+  na.rm = TRUE
+)
+
+n_github_only <- NA_integer_
+n_github_only_strict <- NA_integer_
+n_github_only_asym <- NA_integer_
+
+if (file.exists(GITHUB_ONLY_PATH)) {
   github_only <- readr::read_csv(
     GITHUB_ONLY_PATH,
     show_col_types = FALSE,
     progress = FALSE
   )
+
   if ("observation_key_hash" %in% names(github_only)) {
-    n_distinct(github_only$observation_key_hash)
+    n_github_only <- n_distinct(github_only$observation_key_hash)
   } else {
-    nrow(github_only)
+    n_github_only <- nrow(github_only)
   }
-} else {
-  NA_integer_
+
+  if ("coverage_scope" %in% names(github_only) &&
+      "observation_key_hash" %in% names(github_only)) {
+    n_github_only_strict <- n_distinct(
+      github_only$observation_key_hash[
+        github_only$coverage_scope == "strict_common_operation"
+      ]
+    )
+    n_github_only_asym <- n_distinct(
+      github_only$observation_key_hash[
+        github_only$coverage_scope != "strict_common_operation"
+      ]
+    )
+  }
 }
 
-report_lines <- c(
-  "# CNEMC revision-magnitude audit",
-  "",
-  paste0("- Revised observation keys represented: ", n_revision_keys),
-  paste0("- Revised keys involving numeric/class fields: ", n_numeric_revision_keys),
-  paste0("- Unique GitHub-only observation keys from acquisition audit: ", n_github_only),
-  "",
-  "## Numeric revision magnitude",
-  ""
-)
+# -----------------------------------------------------------------------------
+# 6. Report helpers
+# -----------------------------------------------------------------------------
+format_magnitude_lines <- function(scope_name, n = 12L) {
+  x <- summary_by_scope %>%
+    filter(coverage_scope == scope_name) %>%
+    slice_head(n = n)
 
-if (nrow(summary) > 0L) {
-  magnitude_lines <- vapply(
-    seq_len(nrow(summary)),
+  if (nrow(x) == 0L) return("- No numeric field revisions were available.")
+
+  vapply(
+    seq_len(nrow(x)),
     function(i) {
-      x <- summary[i, ]
+      row <- x[i, ]
       paste0(
-        "- `", x$differing_field, "`: ",
-        x$unique_observation_keys, " revised key(s); median |change| = ",
-        ifelse(is.na(x$median_absolute_change), "NA", format(signif(x$median_absolute_change, 6), trim = TRUE)),
+        "- `", row$differing_field, "`: ",
+        row$unique_observation_keys,
+        " revised key(s); median |change| = ",
+        ifelse(
+          is.na(row$median_absolute_change),
+          "NA",
+          format(signif(row$median_absolute_change, 6), trim = TRUE)
+        ),
         "; p90 |change| = ",
-        ifelse(is.na(x$p90_absolute_change), "NA", format(signif(x$p90_absolute_change, 6), trim = TRUE)),
-        "; qualifier changes = ", x$qualifier_changes
+        ifelse(
+          is.na(row$p90_absolute_change),
+          "NA",
+          format(signif(row$p90_absolute_change, 6), trim = TRUE)
+        ),
+        "; qualifier changes = ", row$qualifier_changes
       )
     },
     character(1)
   )
-  report_lines <- c(report_lines, magnitude_lines)
-} else {
-  report_lines <- c(report_lines, "- No numeric field revisions were available.")
 }
 
+# -----------------------------------------------------------------------------
+# 7. Report
+# -----------------------------------------------------------------------------
 report_lines <- c(
-  report_lines,
+  "# CNEMC revision-magnitude audit",
   "",
-  "## Water-quality class transitions",
+  "## A. Strict common-operation validation",
   "",
-  paste0("- Class-code revisions observed: ", nrow(class_transitions)),
+  paste0("- Revised observation keys represented: ", strict_keys),
+  paste0("- Revised keys involving numeric/class fields: ", strict_numeric_keys),
+  paste0("- GitHub-only observation keys in strict common operation: ", n_github_only_strict),
+  paste0("- Water-quality class transitions: ", strict_class_n),
+  "",
+  "### Numeric revision magnitude",
+  "",
+  format_magnitude_lines("strict_common_operation"),
+  "",
+  "## B. Asymmetric coverage / outage context",
+  "",
+  paste0("- Revised observation keys represented: ", asym_keys),
+  paste0("- Revised keys involving numeric/class fields: ", asym_numeric_keys),
+  paste0("- GitHub-only recovery-gain observation keys: ", n_github_only_asym),
+  paste0("- Water-quality class transitions: ", asym_class_n),
+  "",
+  "### Numeric revision magnitude",
+  "",
+  format_magnitude_lines("asymmetric_coverage"),
+  "",
+  "Revision magnitudes in this section remain scientifically real source-version changes, but they were captured without equivalent PC operating coverage. They should be interpreted as revision provenance plus redundancy benefit, not as primary scraper disagreement.",
+  "",
+  "## C. All-archive revision provenance",
+  "",
+  paste0("- Revised observation keys represented: ", all_keys),
+  paste0("- Revised keys involving numeric/class fields: ", all_numeric_keys),
+  paste0("- Unique GitHub-only observation keys from acquisition audit: ", n_github_only),
+  paste0("- Water-quality class transitions: ", nrow(class_transitions)),
   "",
   "## Interpretation",
   "",
-  "- Absolute and percentage changes are summarized within each parameter only because the parameters use different units and scales.",
-  "- A percentage change can be unstable when the PC comparison value is near zero, so absolute changes should be inspected alongside percentages.",
-  "- Raw censoring/inequality qualifiers (<, >, <=, >=) are preserved and counted separately; a qualifier change can matter even when the extracted numeric value is unchanged.",
-  "- This script quantifies source revisions; it does not decide which revision is scientifically preferable.",
-  "- The eventual canonical dataset should preserve all observed row versions and assign preferred/final-version status in a separate derivation layer.",
+  "- Absolute and percentage changes are summarized within each parameter only because parameters use different units and scales.",
+  "- A percentage change can be unstable when the PC comparison value is near zero; inspect absolute changes alongside percentages.",
+  "- Raw censoring/inequality qualifiers (<, >, <=, >=) are preserved and counted separately.",
+  "- This audit quantifies source revisions; it does not decide which revision is scientifically preferable.",
+  "- `strict_common_operation` is the primary scope for comparing revision behavior while both collectors were available.",
+  "- The canonical dataset should continue to preserve all observed row versions and assign latest/preferred-version status in a separate derivation layer.",
   "",
   "## Outputs",
   "",
   paste0("- Detailed magnitude audit: `", basename(DETAIL_PATH), "`"),
-  paste0("- Field summary: `", basename(SUMMARY_PATH), "`"),
+  paste0("- All-archive field summary: `", basename(SUMMARY_PATH), "`"),
+  paste0("- Scope-aware field summary: `", basename(SUMMARY_SCOPE_PATH), "`"),
   paste0("- Water-quality class transitions: `", basename(CLASS_TRANSITION_PATH), "`")
 )
 
 writeLines(report_lines, REPORT_PATH, useBytes = TRUE)
 
+# -----------------------------------------------------------------------------
+# 8. Console summary
+# -----------------------------------------------------------------------------
 cat("\nCNEMC revision-magnitude audit complete.\n")
-cat("Revised observation keys represented:", n_revision_keys, "\n")
-cat("Revised keys involving numeric/class fields:", n_numeric_revision_keys, "\n")
-cat("Unique GitHub-only observation keys:", n_github_only, "\n")
-cat("\nMagnitude summary:\n")
-print(summary, n = nrow(summary), width = Inf)
+
+cat("\nA. STRICT COMMON-OPERATION VALIDATION\n")
+cat("  Revised observation keys:", strict_keys, "\n")
+cat("  Numeric/class revision keys:", strict_numeric_keys, "\n")
+cat("  GitHub-only observation keys:", n_github_only_strict, "\n")
+cat("  Water-quality class transitions:", strict_class_n, "\n")
+
+strict_summary <- summary_by_scope %>%
+  filter(coverage_scope == "strict_common_operation")
+if (nrow(strict_summary) > 0L) {
+  cat("\n  Magnitude summary:\n")
+  print(
+    strict_summary %>% select(-coverage_scope),
+    n = nrow(strict_summary),
+    width = Inf
+  )
+}
+
+cat("\nB. ASYMMETRIC / OUTAGE COVERAGE\n")
+cat("  Revised observation keys:", asym_keys, "\n")
+cat("  Numeric/class revision keys:", asym_numeric_keys, "\n")
+cat("  GitHub-only recovery-gain keys:", n_github_only_asym, "\n")
+cat("  Water-quality class transitions:", asym_class_n, "\n")
+
+cat("\nC. ALL-ARCHIVE PROVENANCE\n")
+cat("  Revised observation keys:", all_keys, "\n")
+cat("  Numeric/class revision keys:", all_numeric_keys, "\n")
+cat("  GitHub-only observation keys:", n_github_only, "\n")
+cat("  Water-quality class transitions:", nrow(class_transitions), "\n")
+
 if (nrow(class_transitions) > 0L) {
-  cat("\nWater-quality class transitions:\n")
+  cat("\nWater-quality class transitions (all scopes):\n")
   print(class_transitions, n = nrow(class_transitions), width = Inf)
 }
+
 cat("\nOutputs:\n")
 cat(" ", DETAIL_PATH, "\n")
 cat(" ", SUMMARY_PATH, "\n")
+cat(" ", SUMMARY_SCOPE_PATH, "\n")
 cat(" ", CLASS_TRANSITION_PATH, "\n")
 cat(" ", REPORT_PATH, "\n")
