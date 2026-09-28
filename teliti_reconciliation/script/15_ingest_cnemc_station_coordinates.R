@@ -39,6 +39,9 @@ CROSSWALK_FILE <- file.path(PROCESSED_DIR, "cnemc_station_crosswalk.csv")
 CONFLICT_FILE <- file.path(PROCESSED_DIR, "cnemc_station_coordinate_conflicts.csv")
 COVERAGE_FILE <- file.path(PROCESSED_DIR, "cnemc_station_coordinate_coverage.csv")
 CATALOGUE_FILE <- file.path(PROCESSED_DIR, "cnemc_station_catalogue.csv")
+UNMATCHED_CROSSWALK_FILE <- file.path(PROCESSED_DIR, "cnemc_crosswalk_unmatched.csv")
+UNMAPPED_CANONICAL_FILE <- file.path(PROCESSED_DIR, "cnemc_station_unmapped.csv")
+MATCH_DIAGNOSTICS_FILE <- file.path(PROCESSED_DIR, "cnemc_coordinate_match_diagnostics.csv")
 
 SOURCE_URL_DEFAULT <- "https://data.epmap.org/product/water?tab=download"
 SOURCE_LABEL_DEFAULT <- "external_station_metadata"
@@ -395,6 +398,97 @@ load_station_catalogue <- function() {
 }
 
 # ----------------------------------------------------------------------------
+# 4b. Non-destructive match diagnostics
+# ----------------------------------------------------------------------------
+# These helpers NEVER assign coordinates. They only explain why a coordinate
+# record did not match the current canonical CNEMC station catalogue.
+section_match_key <- function(x) {
+  z <- repair_cnemc_mojibake(as.character(x))
+  z <- trimws(z)
+  z <- gsub(intToUtf8(12288L), "", z, fixed = TRUE)
+  z <- gsub("[[:space:][:punct:]]+", "", z, perl = TRUE)
+  tolower(z)
+}
+
+build_unmatched_diagnostics <- function(crosswalk_unmatched, stations) {
+  if (nrow(crosswalk_unmatched) == 0L) return(tibble())
+
+  station_ref <- stations %>%
+    transmute(
+      candidate_station_key = as.character(station_key),
+      candidate_area_cn = as.character(area_cn),
+      candidate_city_cn = as.character(city_cn),
+      candidate_basin_cn = as.character(river_basin_cn),
+      candidate_section_cn = as.character(monitoring_section_cn),
+      area_key = normalize_station_component(area_cn),
+      section_key = section_match_key(monitoring_section_cn)
+    )
+
+  one <- function(i) {
+    r <- crosswalk_unmatched[i, , drop = FALSE]
+    area_key <- normalize_station_component(r$area_cn[[1]])
+    section_key <- section_match_key(r$monitoring_section_cn[[1]])
+
+    same_name <- station_ref[
+      !is.na(station_ref$section_key) & !is.na(section_key) &
+        station_ref$section_key == section_key,
+      , drop = FALSE
+    ]
+    same_area <- station_ref[
+      !is.na(station_ref$area_key) & !is.na(area_key) &
+        station_ref$area_key == area_key,
+      , drop = FALSE
+    ]
+
+    nearest_name <- NA_character_
+    nearest_key <- NA_character_
+    nearest_distance <- NA_integer_
+
+    if (nrow(same_area) > 0L && !is.na(section_key) && nzchar(section_key)) {
+      distances <- as.integer(utils::adist(section_key, same_area$section_key))
+      if (length(distances) > 0L && any(is.finite(distances))) {
+        j <- which.min(distances)
+        nearest_name <- same_area$candidate_section_cn[[j]]
+        nearest_key <- same_area$candidate_station_key[[j]]
+        nearest_distance <- distances[[j]]
+      }
+    }
+
+    reason_hint <- if (nrow(same_name) > 0L) {
+      "same_section_name_exists_but_station_key_differs"
+    } else if (nrow(same_area) > 0L) {
+      "section_name_not_exact_in_same_province"
+    } else {
+      "province_not_present_or_historical_external_station"
+    }
+
+    tibble(
+      station_key = as.character(r$station_key[[1]]),
+      area_cn = as.character(r$area_cn[[1]]),
+      city_cn = as.character(r$city_cn[[1]]),
+      river_basin_cn = as.character(r$river_basin_cn[[1]]),
+      monitoring_section_cn = as.character(r$monitoring_section_cn[[1]]),
+      longitude = suppressWarnings(as.numeric(r$longitude[[1]])),
+      latitude = suppressWarnings(as.numeric(r$latitude[[1]])),
+      coordinate_source = as.character(r$coordinate_source[[1]]),
+      exact_section_candidate_n = nrow(same_name),
+      exact_section_candidate_areas = if (nrow(same_name) > 0L) {
+        paste(sort(unique(same_name$candidate_area_cn)), collapse = ";")
+      } else NA_character_,
+      exact_section_candidate_keys = if (nrow(same_name) > 0L) {
+        paste(sort(unique(same_name$candidate_station_key)), collapse = ";")
+      } else NA_character_,
+      nearest_same_province_section = nearest_name,
+      nearest_same_province_key = nearest_key,
+      nearest_edit_distance = nearest_distance,
+      reason_hint = reason_hint
+    )
+  }
+
+  bind_rows(lapply(seq_len(nrow(crosswalk_unmatched)), one))
+}
+
+# ----------------------------------------------------------------------------
 # 5. Ingest coordinate files
 # ----------------------------------------------------------------------------
 files <- list.files(
@@ -598,5 +692,35 @@ if (nrow(stations) == 0L) {
   )
   msg("Coverage table: ", COVERAGE_FILE)
   msg("Station catalogue cache: ", CATALOGUE_FILE)
-  msg("Coverage audit time: ", sprintf("%.2f", elapsed), " seconds")
+
+  # Coverage diagnostics: explain unused external coordinates without
+  # automatically assigning them to canonical stations.
+  crosswalk_unmatched <- crosswalk %>%
+    anti_join(stations %>% select(station_key), by = "station_key") %>%
+    arrange(area_cn, city_cn, monitoring_section_cn)
+
+  canonical_unmapped <- coverage %>%
+    filter(!has_coordinates) %>%
+    arrange(area_cn, monitoring_section_cn)
+
+  match_diagnostics <- build_unmatched_diagnostics(crosswalk_unmatched, stations)
+
+  readr::write_csv(crosswalk_unmatched, UNMATCHED_CROSSWALK_FILE, na = "")
+  readr::write_csv(canonical_unmapped, UNMAPPED_CANONICAL_FILE, na = "")
+  readr::write_csv(match_diagnostics, MATCH_DIAGNOSTICS_FILE, na = "")
+
+  msg(
+    "External crosswalk rows not in current canonical catalogue: ",
+    nrow(crosswalk_unmatched)
+  )
+  if (nrow(match_diagnostics) > 0L) {
+    msg(
+      "  same section name found under another station key: ",
+      sum(match_diagnostics$exact_section_candidate_n > 0L, na.rm = TRUE)
+    )
+  }
+  msg("Canonical CNEMC stations still unmapped: ", nrow(canonical_unmapped))
+  msg("Match diagnostics: ", MATCH_DIAGNOSTICS_FILE)
+  elapsed <- as.numeric(difftime(Sys.time(), coverage_started, units = "secs"))
+  msg("Coverage + diagnostics time: ", sprintf("%.2f", elapsed), " seconds")
 }
