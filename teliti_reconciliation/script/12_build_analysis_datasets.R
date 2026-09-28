@@ -1,60 +1,16 @@
 # ============================================================================
 # 12_build_analysis_datasets.R
 #
-# Build a stable, non-destructive canonical analysis layer from the reconciled
+# Build a stable, non-destructive canonical analysis layer from reconciled
 # Teliti collection archives.
 #
-# Design principles
-# -----------------
-# 1. Never modify collection/archive files.
-# 2. Prefer the source that reconciliation shows is most complete/current.
-# 3. Preserve source-native published values and provenance.
-# 4. Apply only explicit canonicalization rules here (deduplication/versioning,
-#    source selection, station metadata attachment, coverage flags).
-# 5. Keep volatile collector architecture out of downstream analysis scripts.
-#
-# Canonical source rules
-# ----------------------
-# Fujian weekly:
-#   Rebuild from GitHub persistent canonical year-state files. This captures
-#   current-year source states that may be newer than the PC master.
-#
-# NMEMC marine:
-#   Use the local processed master. Formal reconciliation established exact
-#   equivalence with the GitHub-raw reconstruction.
-#
-# CNEMC surface water:
-#   Build a union of:
-#     - local/PC cumulative version archive,
-#     - GitHub retained nationwide processed checkpoints,
-#     - GitHub Fujian-targeted row-version deltas.
-#   Deduplicate by row_hash, preserve the union as revision history, and derive
-#   one latest-published row per observation_key_hash for ordinary analysis.
-#
-# ONLIMO daily:
-#   Use the local/PC cumulative archive. GitHub daily snapshots are independent
-#   validation/backup samples, not the most complete cumulative history.
-#
-# ONLIMO historical Pollution Index:
-#   Reconstruct from all GitHub immutable observation partitions. Deduplicate
-#   exact station-date-IP versions, select the latest retrieved version for each
-#   station-date, and attach reconciliation station-coverage information.
-#
-# Outputs
-# -------
-# teliti_reconciliation/analysis/
-#   fujian_weekly_analysis.rds
-#   nmemc_marine_analysis.rds
-#   cnemc_latest_analysis.rds
-#   cnemc_revision_history.rds
-#   onlimo_daily_analysis.rds
-#   onlimo_historical_analysis.rds
-#   station_metadata.rds
-#   dataset_inventory.csv
-#   analysis_build_manifest.csv
-#
-# Generated analysis files should normally remain untracked. Version the script,
-# not the derived data, unless you intentionally decide otherwise.
+# CNEMC additions in this version
+# -------------------------------
+# 1. Preserve archived/raw CNEMC strings and hashes unchanged.
+# 2. Decode common UTF-8 mojibake into readable Chinese analysis fields.
+# 3. Extract highest-precision numeric values from CNEMC HTML parameter cells.
+# 4. Attach audited external CNEMC station coordinates when a crosswalk exists.
+# 5. Keep CNEMC revision_history raw/lean; enrich only latest_analysis.
 # ============================================================================
 
 options(stringsAsFactors = FALSE)
@@ -72,7 +28,6 @@ REQUIRE_RECONCILIATION <- TRUE
 ALLOW_FUJIAN_LOCAL_FALLBACK <- FALSE
 WRITE_BUILD_MANIFEST <- TRUE
 
-# Canonical paths -------------------------------------------------------------
 FUJIAN_GITHUB_STATE <- file.path(
   BACKUP_DIR, "fujian_weekly_surfacewater", "state", "source"
 )
@@ -92,6 +47,10 @@ CNEMC_PC_MASTER <- file.path(
   "nmemc_surfacewater_observations.rds"
 )
 CNEMC_GITHUB_ROOT <- file.path(BACKUP_DIR, "cnemc_surfacewater")
+CNEMC_COORD_CROSSWALK <- file.path(
+  PROJECT_DIR, "nmemc", "data", "surfacewater", "processed",
+  "cnemc_station_crosswalk.csv"
+)
 
 ONLIMO_DAILY_ARCHIVE <- file.path(
   PROJECT_DIR, "onlimo", "data", "onlimo_daily_parameters_archive.csv"
@@ -104,7 +63,6 @@ ONLIMO_HIST_COVERAGE <- file.path(
   RECON_OUTPUT_DIR, "onlimo_historical", "onlimo_historical_station_coverage.csv"
 )
 
-# Required reconciliation evidence ------------------------------------------
 RECON_EVIDENCE <- c(
   fujian = file.path(
     RECON_OUTPUT_DIR, "fujian_weekly", "fujian_reconciliation_summary.txt"
@@ -133,6 +91,7 @@ required_packages <- c("dplyr", "readr", "tibble")
 missing_packages <- required_packages[
   !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
 ]
+
 if (length(missing_packages) > 0L) {
   stop(
     "Missing required package(s): ", paste(missing_packages, collapse = ", "),
@@ -208,11 +167,6 @@ md5_if_file <- function(path) {
   unname(as.character(tools::md5sum(path)))
 }
 
-first_existing <- function(paths) {
-  hit <- paths[file.exists(paths)]
-  if (length(hit) == 0L) NA_character_ else hit[[1]]
-}
-
 find_recursive <- function(root, pattern) {
   if (!dir.exists(root)) return(character())
   list.files(
@@ -221,16 +175,6 @@ find_recursive <- function(root, pattern) {
     recursive = TRUE,
     full.names = TRUE
   )
-}
-
-col_or_na <- function(df, candidates, default = NA_character_) {
-  nm <- names(df)
-  low <- tolower(nm)
-  for (cand in candidates) {
-    idx <- match(tolower(cand), low)
-    if (!is.na(idx)) return(df[[idx]])
-  }
-  rep(default, nrow(df))
 }
 
 find_col <- function(df, candidates) {
@@ -269,6 +213,7 @@ find_coord_col_flexible <- function(df, type = c("lon", "lat")) {
     idx <- grep(pat, low, perl = TRUE)
     if (length(idx) > 0L) return(nm[[idx[[1]]]])
   }
+
   NA_character_
 }
 
@@ -314,11 +259,10 @@ parse_date_safe <- function(x) {
     c("^\\d{4}/\\d{2}/\\d{2}$", "%Y/%m/%d"),
     c("^\\d{8}$", "%Y%m%d")
   )
+
   for (sp in specs) {
     idx <- !is.na(ch) & grepl(sp[[1]], ch)
-    if (any(idx)) {
-      out[idx] <- as.Date(ch[idx], format = sp[[2]])
-    }
+    if (any(idx)) out[idx] <- as.Date(ch[idx], format = sp[[2]])
   }
   out
 }
@@ -348,7 +292,6 @@ parse_posix_safe <- function(x, tz = "Asia/Taipei") {
       remaining <- remaining[!ok]
     }
   }
-
   out
 }
 
@@ -368,6 +311,7 @@ coalesce_posix_max <- function(...) {
   ans <- apply(mat, 1, function(z) {
     if (all(is.na(z))) NA_real_ else max(z, na.rm = TRUE)
   })
+
   as.POSIXct(ans, origin = "1970-01-01", tz = "Asia/Taipei")
 }
 
@@ -396,7 +340,289 @@ prefix_except <- function(df, prefix, keep) {
 }
 
 # ----------------------------------------------------------------------------
-# 4. Reconciliation gate
+# 4. CNEMC analytical decoding helpers
+# ----------------------------------------------------------------------------
+repair_cnemc_mojibake <- function(x) {
+  special_cp1252 <- c(
+    `8364` = 128L, `8218` = 130L, `402` = 131L, `8222` = 132L,
+    `8230` = 133L, `8224` = 134L, `8225` = 135L, `710` = 136L,
+    `8240` = 137L, `352` = 138L, `8249` = 139L, `338` = 140L,
+    `381` = 142L, `8216` = 145L, `8217` = 146L, `8220` = 147L,
+    `8221` = 148L, `8226` = 149L, `8211` = 150L, `8212` = 151L,
+    `732` = 152L, `8482` = 153L, `353` = 154L, `8250` = 155L,
+    `339` = 156L, `382` = 158L, `376` = 159L
+  )
+
+  repair_one <- function(s) {
+    if (is.na(s) || !nzchar(s)) return(s)
+    cp <- utf8ToInt(enc2utf8(s))
+    if (length(cp) == 0L) return(s)
+
+    bytes <- integer(length(cp))
+    for (i in seq_along(cp)) {
+      code <- cp[[i]]
+      if (code >= 0L && code <= 255L) {
+        bytes[[i]] <- code
+      } else {
+        key <- as.character(code)
+        if (!key %in% names(special_cp1252)) return(s)
+        bytes[[i]] <- unname(special_cp1252[[key]])
+      }
+    }
+
+    candidate <- rawToChar(as.raw(bytes))
+    Encoding(candidate) <- "UTF-8"
+    valid <- suppressWarnings(iconv(candidate, from = "UTF-8", to = "UTF-8"))
+    if (is.na(valid)) s else valid
+  }
+
+  vapply(as.character(x), repair_one, character(1), USE.NAMES = FALSE)
+}
+
+cnemc_html_to_text <- function(x) {
+  x <- repair_cnemc_mojibake(as.character(x))
+  x <- gsub("(?i)<br\\s*/?>", " ", x, perl = TRUE)
+  x <- gsub("<[^>]+>", "", x, perl = TRUE)
+  x <- gsub("&nbsp;", " ", x, fixed = TRUE)
+  x <- gsub("&lt;", "<", x, fixed = TRUE)
+  x <- gsub("&gt;", ">", x, fixed = TRUE)
+  x <- gsub("&amp;", "&", x, fixed = TRUE)
+  x <- gsub("&mu;", "µ", x, fixed = TRUE)
+  x <- gsub("&sup3;", "³", x, fixed = TRUE)
+  x <- gsub("\\s+", " ", x, perl = TRUE)
+  trimws(x)
+}
+
+cnemc_parameter_text <- function(x) {
+  x <- repair_cnemc_mojibake(as.character(x))
+  out <- cnemc_html_to_text(x)
+
+  has_title <- !is.na(x) & grepl("title\\s*=\\s*['\\\"]", x, perl = TRUE)
+  if (any(has_title)) {
+    title_text <- sub(
+      ".*title\\s*=\\s*['\\\"]([^'\\\"]*)['\\\"].*",
+      "\\1",
+      x[has_title],
+      perl = TRUE
+    )
+    title_text <- cnemc_html_to_text(title_text)
+    title_text <- sub(
+      "^.*?(?:原始值|raw\\s*value)\\s*[:：]\\s*",
+      "",
+      title_text,
+      perl = TRUE,
+      ignore.case = TRUE
+    )
+    out[has_title] <- trimws(title_text)
+  }
+
+  out[out %in% c("", "--", "—", "-", "NA", "N/A", "null", "NULL")] <- NA_character_
+  out
+}
+
+cnemc_parameter_qualifier <- function(x) {
+  z <- cnemc_parameter_text(x)
+  out <- rep(NA_character_, length(z))
+  out[!is.na(z) & grepl("^\\s*<=", z)] <- "<="
+  out[!is.na(z) & grepl("^\\s*>=", z)] <- ">="
+  out[!is.na(z) & grepl("^\\s*<", z) & is.na(out)] <- "<"
+  out[!is.na(z) & grepl("^\\s*>", z) & is.na(out)] <- ">"
+  out[!is.na(z) & grepl("^\\s*≤", z)] <- "<="
+  out[!is.na(z) & grepl("^\\s*≥", z)] <- ">="
+  out
+}
+
+cnemc_parameter_numeric <- function(x) {
+  z <- cnemc_parameter_text(x)
+  suppressWarnings(readr::parse_number(z, na = c("", "NA", "N/A")))
+}
+
+cnemc_decode_water_class <- function(code) {
+  key <- c(`1` = "Ⅰ", `2` = "Ⅱ", `3` = "Ⅲ", `4` = "Ⅳ", `5` = "Ⅴ", `6` = "劣Ⅴ")
+  z <- trimws(as.character(code))
+  out <- unname(key[z])
+  out[!z %in% names(key)] <- NA_character_
+  out
+}
+
+clean_cnemc_analysis_fields <- function(df) {
+  if (is.null(df) || nrow(df) == 0L) return(df)
+
+  text_map <- c(
+    area = "area_cn",
+    river_basin = "river_basin_cn",
+    monitoring_section = "monitoring_section_cn"
+  )
+
+  for (src in names(text_map)) {
+    if (src %in% names(df)) {
+      df[[text_map[[src]]]] <- repair_cnemc_mojibake(df[[src]])
+    }
+  }
+
+  if ("water_quality_class" %in% names(df)) {
+    df$water_quality_class_published <- repair_cnemc_mojibake(df$water_quality_class)
+  }
+
+  if ("water_quality_class_code" %in% names(df)) {
+    rank <- suppressWarnings(as.integer(as.character(df$water_quality_class_code)))
+    rank[!rank %in% 1:6] <- NA_integer_
+    df$water_quality_class_rank <- rank
+    df$water_quality_class_clean <- cnemc_decode_water_class(df$water_quality_class_code)
+
+    if ("water_quality_class_published" %in% names(df)) {
+      fill <- is.na(df$water_quality_class_clean) &
+        !is.na(df$water_quality_class_published) &
+        nzchar(df$water_quality_class_published)
+      df$water_quality_class_clean[fill] <- df$water_quality_class_published[fill]
+    }
+  } else if ("water_quality_class_published" %in% names(df)) {
+    df$water_quality_class_clean <- df$water_quality_class_published
+  }
+
+  parameter_map <- c(
+    water_temperature_c_raw = "water_temperature_c",
+    ph_raw = "ph",
+    dissolved_oxygen_mg_l_raw = "dissolved_oxygen_mg_l",
+    conductivity_raw = "conductivity_us_cm",
+    turbidity_ntu_raw = "turbidity_ntu",
+    permanganate_index_mg_l_raw = "permanganate_index_mg_l",
+    ammonia_nitrogen_mg_l_raw = "ammonia_nitrogen_mg_l",
+    total_phosphorus_mg_l_raw = "total_phosphorus_mg_l",
+    total_nitrogen_mg_l_raw = "total_nitrogen_mg_l",
+    toc_mg_l_raw = "toc_mg_l",
+    chlorophyll_a_raw = "chlorophyll_a",
+    algal_density_raw = "algal_density_cells_l"
+  )
+
+  for (src in names(parameter_map)) {
+    if (!src %in% names(df)) next
+    dest <- parameter_map[[src]]
+    df[[dest]] <- cnemc_parameter_numeric(df[[src]])
+    df[[paste0(dest, "_qualifier")]] <- cnemc_parameter_qualifier(df[[src]])
+  }
+
+  if (all(c("area_cn", "monitoring_section_cn") %in% names(df))) {
+    df$analysis_station_key <- paste(
+      normalize_station_key(df$area_cn),
+      normalize_station_key(df$monitoring_section_cn),
+      sep = "|"
+    )
+  }
+
+  df
+}
+
+attach_cnemc_station_coordinates <- function(df, crosswalk_path) {
+  if (is.null(df) || nrow(df) == 0L) return(df)
+  if (!"analysis_station_key" %in% names(df)) {
+    df <- clean_cnemc_analysis_fields(df)
+  }
+
+  if (!file.exists(crosswalk_path)) {
+    msg("CNEMC coordinate crosswalk not found; continuing without external coordinates.")
+    return(df)
+  }
+
+  cw <- safe_read_csv(crosswalk_path)
+  if (is.null(cw) || nrow(cw) == 0L) return(df)
+
+  required <- c("station_key", "longitude", "latitude")
+  missing <- setdiff(required, names(cw))
+  if (length(missing) > 0L) {
+    stop(
+      "CNEMC coordinate crosswalk is missing required column(s): ",
+      paste(missing, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  cw <- cw %>%
+    mutate(
+      station_key = as.character(station_key),
+      longitude = suppressWarnings(as.numeric(longitude)),
+      latitude = suppressWarnings(as.numeric(latitude))
+    ) %>%
+    filter(
+      !is.na(station_key), nzchar(station_key),
+      valid_lonlat(longitude, latitude)
+    )
+
+  if (anyDuplicated(cw$station_key)) {
+    stop(
+      "CNEMC coordinate crosswalk contains duplicated station_key values. ",
+      "Resolve conflicts before attaching coordinates.",
+      call. = FALSE
+    )
+  }
+
+  get_or_na <- function(nm) {
+    if (nm %in% names(cw)) as.character(cw[[nm]]) else rep(NA_character_, nrow(cw))
+  }
+
+  lookup <- tibble(
+    analysis_station_key = cw$station_key,
+    cnemc_crosswalk_longitude = cw$longitude,
+    cnemc_crosswalk_latitude = cw$latitude,
+    cnemc_crosswalk_city = get_or_na("city_cn"),
+    cnemc_crosswalk_coordinate_source = get_or_na("coordinate_source"),
+    cnemc_crosswalk_source_url = get_or_na("source_url")
+  )
+
+  out <- left_join(df, lookup, by = "analysis_station_key")
+
+  existing_lon <- if ("station_longitude" %in% names(out)) {
+    suppressWarnings(as.numeric(out$station_longitude))
+  } else {
+    rep(NA_real_, nrow(out))
+  }
+  existing_lat <- if ("station_latitude" %in% names(out)) {
+    suppressWarnings(as.numeric(out$station_latitude))
+  } else {
+    rep(NA_real_, nrow(out))
+  }
+
+  use_crosswalk <- valid_lonlat(
+    out$cnemc_crosswalk_longitude,
+    out$cnemc_crosswalk_latitude
+  ) & (!valid_lonlat(existing_lon, existing_lat))
+
+  out$station_longitude <- existing_lon
+  out$station_latitude <- existing_lat
+  out$station_longitude[use_crosswalk] <- out$cnemc_crosswalk_longitude[use_crosswalk]
+  out$station_latitude[use_crosswalk] <- out$cnemc_crosswalk_latitude[use_crosswalk]
+
+  if (!"station_city" %in% names(out)) out$station_city <- NA_character_
+  city_fill <- use_crosswalk & !is.na(out$cnemc_crosswalk_city) & nzchar(out$cnemc_crosswalk_city)
+  out$station_city[city_fill] <- out$cnemc_crosswalk_city[city_fill]
+
+  if (!"station_coordinate_source" %in% names(out)) {
+    out$station_coordinate_source <- NA_character_
+  }
+  out$station_coordinate_source[use_crosswalk] <- ifelse(
+    is.na(out$cnemc_crosswalk_coordinate_source[use_crosswalk]) |
+      !nzchar(out$cnemc_crosswalk_coordinate_source[use_crosswalk]),
+    "cnemc_station_crosswalk",
+    out$cnemc_crosswalk_coordinate_source[use_crosswalk]
+  )
+
+  if (!"station_coordinate_source_url" %in% names(out)) {
+    out$station_coordinate_source_url <- NA_character_
+  }
+  out$station_coordinate_source_url[use_crosswalk] <- out$cnemc_crosswalk_source_url[use_crosswalk]
+
+  out %>%
+    select(
+      -cnemc_crosswalk_longitude,
+      -cnemc_crosswalk_latitude,
+      -cnemc_crosswalk_city,
+      -cnemc_crosswalk_coordinate_source,
+      -cnemc_crosswalk_source_url
+    )
+}
+
+# ----------------------------------------------------------------------------
+# 5. Reconciliation gate
 # ----------------------------------------------------------------------------
 if (isTRUE(REQUIRE_RECONCILIATION)) {
   evidence_ok <- vapply(
@@ -404,6 +630,7 @@ if (isTRUE(REQUIRE_RECONCILIATION)) {
     function(x) if (dir.exists(x)) TRUE else file.exists(x),
     logical(1)
   )
+
   if (!all(evidence_ok)) {
     missing <- names(RECON_EVIDENCE)[!evidence_ok]
     stop(
@@ -416,7 +643,7 @@ if (isTRUE(REQUIRE_RECONCILIATION)) {
 }
 
 # ----------------------------------------------------------------------------
-# 5. Fujian weekly: rebuild canonical master from GitHub persistent state
+# 6. Fujian weekly
 # ----------------------------------------------------------------------------
 source_col_or_na <- function(df, nm) {
   if (nm %in% names(df)) return(df[[nm]])
@@ -434,14 +661,10 @@ was5_period_to_date <- function(x) {
   }
 
   is_dmy <- !is.na(z) & grepl("^[0-9]{1,2}/[0-9]{1,2}/[0-9]{4}$", z)
-  if (any(is_dmy)) {
-    out[is_dmy] <- as.Date(z[is_dmy], format = "%d/%m/%Y")
-  }
+  if (any(is_dmy)) out[is_dmy] <- as.Date(z[is_dmy], format = "%d/%m/%Y")
 
   is_iso <- !is.na(z) & grepl("^[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}$", z)
-  if (any(is_iso)) {
-    out[is_iso] <- as.Date(z[is_iso], format = "%Y-%m-%d")
-  }
+  if (any(is_iso)) out[is_iso] <- as.Date(z[is_iso], format = "%Y-%m-%d")
 
   out
 }
@@ -542,7 +765,6 @@ standardize_fujian_year <- function(raw_df, year, meta, source_filename) {
 
 find_fujian_crosswalk <- function() {
   root <- file.path(PROJECT_DIR, "fujian_surfacewater")
-
   candidates <- unique(c(
     file.path(FUJIAN_LOCAL_PROCESSED, "fujian_station_crosswalk.csv"),
     file.path(root, "data", "fujian_station_crosswalk.csv"),
@@ -551,7 +773,6 @@ find_fujian_crosswalk <- function() {
   ))
 
   candidates <- candidates[file.exists(candidates)]
-
   if (length(candidates) == 0L) {
     msg("No Fujian station crosswalk found.")
     return(NA_character_)
@@ -559,32 +780,18 @@ find_fujian_crosswalk <- function() {
 
   scored <- lapply(candidates, function(path) {
     cw <- safe_read_csv(path)
-
     if (is.null(cw) || nrow(cw) == 0L) {
-      return(tibble(
-        path = path,
-        rows = 0L,
-        valid_coordinates = 0L
-      ))
+      return(tibble(path = path, rows = 0L, valid_coordinates = 0L))
     }
 
     lon_col <- find_coord_col_flexible(cw, "lon")
     lat_col <- find_coord_col_flexible(cw, "lat")
-
     if (is.na(lon_col) || is.na(lat_col)) {
-      return(tibble(
-        path = path,
-        rows = nrow(cw),
-        valid_coordinates = 0L
-      ))
+      return(tibble(path = path, rows = nrow(cw), valid_coordinates = 0L))
     }
 
-    lon <- suppressWarnings(
-      readr::parse_number(as.character(cw[[lon_col]]))
-    )
-    lat <- suppressWarnings(
-      readr::parse_number(as.character(cw[[lat_col]]))
-    )
+    lon <- suppressWarnings(readr::parse_number(as.character(cw[[lon_col]])))
+    lat <- suppressWarnings(readr::parse_number(as.character(cw[[lat_col]])))
 
     tibble(
       path = path,
@@ -596,23 +803,11 @@ find_fujian_crosswalk <- function() {
     arrange(desc(valid_coordinates), desc(rows))
 
   best <- scored %>% slice(1)
-
   msg(
     "Fujian crosswalk selected: ", best$path,
     " | rows=", best$rows,
     " | valid coordinates=", best$valid_coordinates
   )
-
-  if (best$valid_coordinates == 0L) {
-    cw <- safe_read_csv(best$path)
-    msg(
-      "WARNING: selected Fujian crosswalk contains no recognized coordinates."
-    )
-    msg(
-      "Crosswalk columns: ",
-      paste(names(cw), collapse = ", ")
-    )
-  }
 
   best$path[[1]]
 }
@@ -624,29 +819,14 @@ build_fujian_crosswalk_lookup <- function(path) {
 
   name_col <- find_col(
     cw,
-    c(
-      "station_name", "station_name_cn", "station_name_zh",
-      "station", "site_name", "站点名称"
-    )
+    c("station_name", "station_name_cn", "station_name_zh", "station", "site_name", "站点名称")
   )
-  raw_name_col <- find_col(
-    cw,
-    c("station_name_raw", "station_raw", "site_name_raw")
-  )
+  raw_name_col <- find_col(cw, c("station_name_raw", "station_raw", "site_name_raw"))
   lon_col <- find_coord_col_flexible(cw, "lon")
   lat_col <- find_coord_col_flexible(cw, "lat")
-  city_col <- find_col(
-    cw,
-    c("city", "prefecture", "municipality", "admin_city", "city_name")
-  )
-  en_col <- find_col(
-    cw,
-    c("station_name_en", "english_name", "name_en")
-  )
-  id_col <- find_col(
-    cw,
-    c("mn", "station_id", "site_code", "station_code")
-  )
+  city_col <- find_col(cw, c("city", "prefecture", "municipality", "admin_city", "city_name"))
+  en_col <- find_col(cw, c("station_name_en", "english_name", "name_en"))
+  id_col <- find_col(cw, c("mn", "station_id", "site_code", "station_code"))
 
   if (is.na(name_col) && is.na(raw_name_col)) return(NULL)
 
@@ -662,26 +842,23 @@ build_fujian_crosswalk_lookup <- function(path) {
     station_city = if (!is.na(city_col)) as.character(cw[[city_col]]) else NA_character_,
     station_longitude = if (!is.na(lon_col)) {
       suppressWarnings(readr::parse_number(as.character(cw[[lon_col]])))
-    } else {
-      NA_real_
-    },
+    } else NA_real_,
     station_latitude = if (!is.na(lat_col)) {
       suppressWarnings(readr::parse_number(as.character(cw[[lat_col]])))
-    } else {
-      NA_real_
-    },
+    } else NA_real_,
     station_metadata_source = basename(path)
   )
 
   metadata_cols <- setdiff(names(base_lookup), c("primary_key", "raw_key"))
-  primary_lookup <- base_lookup %>%
-    mutate(station_name_key = primary_key) %>%
-    select(station_name_key, all_of(metadata_cols))
-  raw_lookup <- base_lookup %>%
-    mutate(station_name_key = raw_key) %>%
-    select(station_name_key, all_of(metadata_cols))
 
-  bind_rows(primary_lookup, raw_lookup) %>%
+  bind_rows(
+    base_lookup %>%
+      mutate(station_name_key = primary_key) %>%
+      select(station_name_key, all_of(metadata_cols)),
+    base_lookup %>%
+      mutate(station_name_key = raw_key) %>%
+      select(station_name_key, all_of(metadata_cols))
+  ) %>%
     filter(!is.na(station_name_key), nzchar(station_name_key)) %>%
     arrange(
       station_name_key,
@@ -767,6 +944,7 @@ build_fujian <- function() {
     pattern = "^fujian_weekly_[0-9]{4}\\.rds$",
     full.names = TRUE
   )
+
   if (length(year_files) == 0L) {
     stop("No Fujian canonical year RDS files found in: ", source_dir, call. = FALSE)
   }
@@ -785,9 +963,8 @@ build_fujian <- function() {
     meta_file <- file.path(source_dir, sprintf("fujian_weekly_%d_meta.rds", yr))
     meta <- if (file.exists(meta_file)) {
       tryCatch(readRDS(meta_file), error = function(e) list())
-    } else {
-      list()
-    }
+    } else list()
+
     parts[[i]] <- standardize_fujian_year(raw, yr, meta, basename(year_files[[i]]))
   }
 
@@ -808,12 +985,9 @@ build_fujian <- function() {
 
   crosswalk_path <- find_fujian_crosswalk()
   lookup <- build_fujian_crosswalk_lookup(crosswalk_path)
+
   if (!is.null(lookup)) {
-    dat <- dat %>%
-      left_join(
-        lookup,
-        by = "station_name_key"
-      )
+    dat <- dat %>% left_join(lookup, by = "station_name_key")
   } else {
     dat <- dat %>%
       mutate(
@@ -831,7 +1005,7 @@ build_fujian <- function() {
 }
 
 # ----------------------------------------------------------------------------
-# 6. NMEMC marine: exact reconciled local processed master
+# 7. NMEMC marine
 # ----------------------------------------------------------------------------
 build_nmemc_marine <- function() {
   msg("Building NMEMC marine canonical analysis dataset ...")
@@ -839,22 +1013,17 @@ build_nmemc_marine <- function() {
     stop("NMEMC marine master is missing: ", NMEMC_MARINE_MASTER, call. = FALSE)
   }
   dat <- readRDS(NMEMC_MARINE_MASTER)
-  dat$analysis_source_basis <- "local_processed_master_exactly_reconciled"
+  dat$analysis_source_basis <- "local_processed_master_reconciled"
   dat
 }
 
 # ----------------------------------------------------------------------------
-# 7. CNEMC: reconciled union of PC versions + GitHub checkpoints + target deltas
+# 8. CNEMC: PC + GitHub version union
 # ----------------------------------------------------------------------------
-# CNEMC CSV files come from multiple archive products and readr may infer
-# different column types from different files (for example a class code can
-# be numeric in one CSV and character in another). Read these files
-# conservatively as character first. They are cast to the processed PC-master
-# schema immediately before the reconciled union is assembled.
 read_cnemc_csv_files <- function(files, source_label) {
   if (length(files) == 0L) return(tibble())
-  pieces <- vector("list", length(files))
 
+  pieces <- vector("list", length(files))
   for (i in seq_along(files)) {
     x <- safe_read_csv(
       files[[i]],
@@ -869,29 +1038,12 @@ read_cnemc_csv_files <- function(files, source_label) {
   bind_rows(pieces)
 }
 
-cast_like_reference <- function(x, reference, column_name = "") {
-  # Preserve exact published strings whenever the canonical processed schema
-  # treats the field as character. This includes *_raw values, hashes and the
-  # current water_quality_class_code field.
-  if (is.character(reference) || is.factor(reference)) {
-    return(as.character(x))
-  }
-
-  if (inherits(reference, "POSIXt")) {
-    return(parse_posix_safe(x))
-  }
-
-  if (inherits(reference, "Date")) {
-    return(parse_date_safe(x))
-  }
-
-  if (is.integer(reference)) {
-    return(suppressWarnings(as.integer(x)))
-  }
-
-  if (is.double(reference) || is.numeric(reference)) {
-    return(suppressWarnings(as.numeric(x)))
-  }
+cast_like_reference <- function(x, reference) {
+  if (is.character(reference) || is.factor(reference)) return(as.character(x))
+  if (inherits(reference, "POSIXt")) return(parse_posix_safe(x))
+  if (inherits(reference, "Date")) return(parse_date_safe(x))
+  if (is.integer(reference)) return(suppressWarnings(as.integer(x)))
+  if (is.double(reference) || is.numeric(reference)) return(suppressWarnings(as.numeric(x)))
 
   if (is.logical(reference)) {
     ch <- tolower(trim_na(x))
@@ -901,8 +1053,6 @@ cast_like_reference <- function(x, reference, column_name = "") {
     return(out)
   }
 
-  # Unknown/list-like classes should not block reconstruction of the
-  # analytical archive. Character is the safest lossless CSV representation.
   as.character(x)
 }
 
@@ -911,12 +1061,13 @@ align_cnemc_schema <- function(df, reference) {
 
   common <- intersect(names(df), names(reference))
   for (nm in common) {
-    df[[nm]] <- cast_like_reference(df[[nm]], reference[[nm]], nm)
+    df[[nm]] <- cast_like_reference(df[[nm]], reference[[nm]])
   }
 
-  # These analysis-only provenance fields are intentionally character in all
-  # archive sources regardless of how readr might otherwise infer them.
-  for (nm in intersect(c("analysis_archive_source", "analysis_archive_file"), names(df))) {
+  for (nm in intersect(
+    c("analysis_archive_source", "analysis_archive_file"),
+    names(df)
+  )) {
     df[[nm]] <- as.character(df[[nm]])
   }
 
@@ -954,9 +1105,6 @@ build_cnemc <- function() {
     "github_targeted_delta"
   )
 
-  # Harmonize the CSV-derived archives to the processed PC master schema
-  # before row-binding. This prevents readr type-guess differences from
-  # becoming false schema conflicts while preserving the canonical types.
   gh_checkpoints <- align_cnemc_schema(gh_checkpoints, pc)
   gh_targeted <- align_cnemc_schema(gh_targeted, pc)
 
@@ -985,8 +1133,6 @@ build_cnemc <- function() {
       !is.na(observation_key_hash), nzchar(as.character(observation_key_hash))
     )
 
-  # A single row_hash can appear in both collectors/checkpoints. Preserve one
-  # scientific row while recording every archive source that represented it.
   source_map <- all_versions %>%
     group_by(row_hash) %>%
     summarise(
@@ -997,9 +1143,6 @@ build_cnemc <- function() {
       .groups = "drop"
     )
 
-  # Derive a comparable "seen/published by collection" timestamp before
-  # deduplication. last_seen is valuable for the PC cumulative archive;
-  # delta_archived_at / collected_at carry the GitHub publication capture time.
   n <- nrow(all_versions)
   get_time_col <- function(nm) {
     if (nm %in% names(all_versions)) all_versions[[nm]] else rep(NA_character_, n)
@@ -1034,6 +1177,16 @@ build_cnemc <- function() {
       analysis_version_rule = "latest_seen_row_version_per_observation_key_hash"
     )
 
+  # --------------------------------------------------------------------------
+  # ANALYSIS ENRICHMENT — deliberately after version selection.
+  # Raw source strings, row_hash and observation_key_hash stay unchanged.
+  # --------------------------------------------------------------------------
+  latest <- clean_cnemc_analysis_fields(latest)
+  latest <- attach_cnemc_station_coordinates(
+    latest,
+    CNEMC_COORD_CROSSWALK
+  )
+
   assert_unique(history, "row_hash", "CNEMC revision history")
   assert_unique(latest, "observation_key_hash", "CNEMC latest analysis view")
 
@@ -1041,10 +1194,11 @@ build_cnemc <- function() {
 }
 
 # ----------------------------------------------------------------------------
-# 8. ONLIMO daily: cumulative PC archive
+# 9. ONLIMO daily
 # ----------------------------------------------------------------------------
 build_onlimo_daily <- function() {
   msg("Building ONLIMO daily canonical analysis dataset ...")
+
   if (!file.exists(ONLIMO_DAILY_ARCHIVE)) {
     stop("ONLIMO daily cumulative archive is missing: ", ONLIMO_DAILY_ARCHIVE, call. = FALSE)
   }
@@ -1074,7 +1228,7 @@ build_onlimo_daily <- function() {
 }
 
 # ----------------------------------------------------------------------------
-# 9. ONLIMO historical: reconstruct GitHub immutable partitions
+# 10. ONLIMO historical
 # ----------------------------------------------------------------------------
 build_onlimo_historical <- function() {
   msg("Building ONLIMO historical canonical analysis dataset ...")
@@ -1084,6 +1238,7 @@ build_onlimo_historical <- function() {
     snapshot_root,
     "^onlimo_pollution_index_.*\\.csv\\.gz$"
   )
+
   if (length(files) == 0L) {
     stop(
       "No ONLIMO historical GitHub observation partitions found under: ",
@@ -1123,8 +1278,6 @@ build_onlimo_historical <- function() {
     )
   }
 
-  # Preserve only one copy of identical station-date-IP versions across
-  # partitions. Prefer the latest retrieved_at when present, then later file.
   if ("retrieved_at" %in% names(raw)) {
     raw$analysis_retrieved_at <- parse_posix_safe(raw$retrieved_at)
   } else {
@@ -1161,13 +1314,13 @@ build_onlimo_historical <- function() {
       analysis_version_rule = "latest_retrieved_version_per_station_date"
     )
 
-  # Attach the latest reconciliation coverage table without guessing its schema.
   coverage <- safe_read_csv(ONLIMO_HIST_COVERAGE)
   if (!is.null(coverage) && nrow(coverage) > 0L && "station_id" %in% names(coverage)) {
     coverage <- coverage %>%
       mutate(station_id = as.character(station_id)) %>%
       arrange(station_id) %>%
       distinct(station_id, .keep_all = TRUE)
+
     coverage <- prefix_except(coverage, "coverage_", keep = "station_id")
     latest <- latest %>% left_join(coverage, by = "station_id")
   } else {
@@ -1183,13 +1336,12 @@ build_onlimo_historical <- function() {
 }
 
 # ----------------------------------------------------------------------------
-# 10. Unified station metadata
+# 11. Unified station metadata
 # ----------------------------------------------------------------------------
 build_station_metadata <- function(fujian, nmemc, cnemc_latest, onlimo_daily, onlimo_hist) {
   msg("Building unified station metadata ...")
 
   # Fujian -------------------------------------------------------------------
-  # Start with stations represented in the canonical observation archive.
   fujian_observed <- fujian %>%
     group_by(station_name_key) %>%
     summarise(
@@ -1208,9 +1360,6 @@ build_station_metadata <- function(fujian, nmemc, cnemc_latest, onlimo_daily, on
     mutate(station_key = station_name_key) %>%
     select(-station_name_key)
 
-  # Also read coordinate-bearing crosswalk rows directly. This is deliberate:
-  # recovered coordinates must not disappear merely because a translated or
-  # normalized station name fails an exact observation-to-crosswalk join.
   fujian_crosswalk <- build_fujian_crosswalk_station_rows(find_fujian_crosswalk())
 
   fujian_station <- bind_rows(fujian_observed, fujian_crosswalk) %>%
@@ -1238,8 +1387,6 @@ build_station_metadata <- function(fujian, nmemc, cnemc_latest, onlimo_daily, on
     )
 
   # NMEMC --------------------------------------------------------------------
-  # The processed marine master uses site_code as the site identifier. There
-  # is no separate human-readable site-name field in the canonical master.
   nmemc_name <- find_col(nmemc, c("site", "site_name", "station_name", "site_code"))
   nmemc_id <- find_col(nmemc, c("site_code", "station_id", "site"))
   nmemc_lon <- find_coord_col_flexible(nmemc, "lon")
@@ -1278,8 +1425,8 @@ build_station_metadata <- function(fujian, nmemc, cnemc_latest, onlimo_daily, on
     on_ws <- find_col(catalog, c("watershed", "river", "das"))
     on_prov <- find_col(catalog, c("province", "provinsi"))
     on_city <- find_col(catalog, c("kabupaten_kota", "city", "kota", "kabupaten"))
-
     historical_ids <- unique(as.character(onlimo_hist$station_id))
+
     onlimo_station <- tibble(
       network = "ONLIMO",
       station_id = if (!is.na(on_id)) as.character(catalog[[on_id]]) else NA_character_,
@@ -1293,25 +1440,32 @@ build_station_metadata <- function(fujian, nmemc, cnemc_latest, onlimo_daily, on
       coordinate_source = "onlimo_station_catalog",
       in_historical_ip = if (!is.na(on_id)) as.character(catalog[[on_id]]) %in% historical_ids else FALSE
     ) %>%
-      mutate(station_key = ifelse(
-        !is.na(station_id) & nzchar(station_id),
-        station_id,
-        normalize_station_key(station_name)
-      )) %>%
+      mutate(
+        station_key = ifelse(
+          !is.na(station_id) & nzchar(station_id),
+          station_id,
+          normalize_station_key(station_name)
+        )
+      ) %>%
       distinct(network, station_key, .keep_all = TRUE)
   } else {
     onlimo_station <- tibble()
   }
 
   # CNEMC --------------------------------------------------------------------
-  # CNEMC's processed nationwide endpoint often lacks coordinates. Preserve
-  # the stations in metadata, but do not fabricate locations. If coordinate
-  # fields appear in a future canonical archive they are used automatically.
-  cn_name <- find_col(cnemc_latest, c("monitoring_section", "station_name", "section_name"))
+  cn_name <- find_col(
+    cnemc_latest,
+    c("monitoring_section_cn", "monitoring_section", "station_name", "section_name")
+  )
   cn_lon <- find_coord_col_flexible(cnemc_latest, "lon")
   cn_lat <- find_coord_col_flexible(cnemc_latest, "lat")
-  cn_area <- find_col(cnemc_latest, c("area", "province"))
-  cn_river <- find_col(cnemc_latest, c("river_basin", "river"))
+  cn_area <- find_col(cnemc_latest, c("area_cn", "area", "province"))
+  cn_river <- find_col(cnemc_latest, c("river_basin_cn", "river_basin", "river"))
+  cn_city <- find_col(cnemc_latest, c("station_city", "city"))
+  cn_coordinate_source <- find_col(
+    cnemc_latest,
+    c("station_coordinate_source", "coordinate_source")
+  )
 
   if (!is.na(cn_name)) {
     cnemc_station <- tibble(
@@ -1321,10 +1475,16 @@ build_station_metadata <- function(fujian, nmemc, cnemc_latest, onlimo_daily, on
       station_name_en = NA_character_,
       waterbody = if (!is.na(cn_river)) as.character(cnemc_latest[[cn_river]]) else NA_character_,
       admin1 = if (!is.na(cn_area)) as.character(cnemc_latest[[cn_area]]) else NA_character_,
-      admin2 = NA_character_,
+      admin2 = if (!is.na(cn_city)) as.character(cnemc_latest[[cn_city]]) else NA_character_,
       longitude = if (!is.na(cn_lon)) suppressWarnings(as.numeric(cnemc_latest[[cn_lon]])) else NA_real_,
       latitude = if (!is.na(cn_lat)) suppressWarnings(as.numeric(cnemc_latest[[cn_lat]])) else NA_real_,
-      coordinate_source = if (!is.na(cn_lon) && !is.na(cn_lat)) "cnemc_latest" else NA_character_
+      coordinate_source = if (!is.na(cn_coordinate_source)) {
+        as.character(cnemc_latest[[cn_coordinate_source]])
+      } else if (!is.na(cn_lon) && !is.na(cn_lat)) {
+        "cnemc_latest"
+      } else {
+        NA_character_
+      }
     ) %>%
       mutate(station_key = paste(admin1, normalize_station_key(station_name), sep = "|")) %>%
       arrange(station_key, desc(valid_lonlat(longitude, latitude))) %>%
@@ -1333,16 +1493,22 @@ build_station_metadata <- function(fujian, nmemc, cnemc_latest, onlimo_daily, on
     cnemc_station <- tibble()
   }
 
-  out <- bind_rows(fujian_station, nmemc_station, onlimo_station, cnemc_station) %>%
+  out <- bind_rows(
+    fujian_station,
+    nmemc_station,
+    onlimo_station,
+    cnemc_station
+  ) %>%
     arrange(network, station_name)
 
   if (!"in_historical_ip" %in% names(out)) out$in_historical_ip <- FALSE
   out$in_historical_ip[is.na(out$in_historical_ip)] <- FALSE
+
   out
 }
 
 # ----------------------------------------------------------------------------
-# 11. Dataset inventory helpers
+# 12. Inventory helpers
 # ----------------------------------------------------------------------------
 date_range <- function(df) {
   candidates <- c(
@@ -1365,8 +1531,7 @@ date_range <- function(df) {
   } else if (!inherits(x, "Date")) {
     x_date <- parse_date_safe(x)
     if (all(is.na(x_date))) {
-      x_posix <- parse_posix_safe(x)
-      x <- as.Date(x_posix)
+      x <- as.Date(parse_posix_safe(x))
     } else {
       x <- x_date
     }
@@ -1377,7 +1542,9 @@ date_range <- function(df) {
   c(as.character(min(x)), as.character(max(x)))
 }
 
-make_inventory_row <- function(name, df, key_desc, source_rule, validation_status, output_path, notes = "") {
+make_inventory_row <- function(
+  name, df, key_desc, source_rule, validation_status, output_path, notes = ""
+) {
   rng <- date_range(df)
   tibble(
     dataset = name,
@@ -1397,13 +1564,14 @@ make_inventory_row <- function(name, df, key_desc, source_rule, validation_statu
 }
 
 # ----------------------------------------------------------------------------
-# 12. Build all canonical datasets
+# 13. Build all canonical datasets
 # ----------------------------------------------------------------------------
 fujian <- build_fujian()
 nmemc_marine <- build_nmemc_marine()
 cnemc <- build_cnemc()
 onlimo_daily <- build_onlimo_daily()
 onlimo_historical <- build_onlimo_historical()
+
 station_metadata <- build_station_metadata(
   fujian,
   nmemc_marine,
@@ -1413,7 +1581,7 @@ station_metadata <- build_station_metadata(
 )
 
 # ----------------------------------------------------------------------------
-# 13. Save analysis datasets
+# 14. Save analysis datasets
 # ----------------------------------------------------------------------------
 paths <- list(
   fujian = file.path(ANALYSIS_DIR, "fujian_weekly_analysis.rds"),
@@ -1458,24 +1626,24 @@ write_csv_atomic(
 )
 
 # ----------------------------------------------------------------------------
-# 14. Dataset inventory
+# 15. Dataset inventory
 # ----------------------------------------------------------------------------
 inventory <- bind_rows(
   make_inventory_row(
     "fujian_weekly_analysis", fujian,
     "observation_key",
     "GitHub persistent canonical year state; rebuilt with scraper-equivalent processing",
-    "PASS_WITH_CURRENT_YEAR_TIMING; completed years exact; shared payload 100%",
+    "PASS_WITH_CURRENT_YEAR_TIMING",
     paths$fujian,
-    "Current-year GitHub-only recent keys retained. Station crosswalk coordinates attached when available."
+    "Current-year GitHub-only recent keys retained. Station crosswalk metadata attached when available."
   ),
   make_inventory_row(
     "nmemc_marine_analysis", nmemc_marine,
     "source-native row",
-    "Local processed master proven exactly reproducible from GitHub raw annual files",
-    "PASS",
+    "Local processed master",
+    "RECONCILIATION_EVIDENCE_REQUIRED",
     paths$nmemc,
-    "10/10 annual sources reconciled exactly at latest reconciliation."
+    "Use the latest NMEMC reconciliation output to interpret current-year source differences."
   ),
   make_inventory_row(
     "cnemc_latest_analysis", cnemc$latest,
@@ -1483,7 +1651,7 @@ inventory <- bind_rows(
     "Latest row version from reconciled PC + GitHub version union",
     "ROW_RECONCILED_WITH_SOURCE_REVISION_CONTEXT",
     paths$cnemc_latest,
-    "Use for ordinary CNEMC environmental analyses; revision history is preserved separately."
+    "Human-readable CNEMC fields and numeric parameters are derived after version selection; raw/hash fields are preserved."
   ),
   make_inventory_row(
     "cnemc_revision_history", cnemc$history,
@@ -1491,15 +1659,15 @@ inventory <- bind_rows(
     "Union of PC cumulative versions, GitHub full checkpoints, and GitHub targeted deltas",
     "ROW_RECONCILED_WITH_SOURCE_REVISION_CONTEXT",
     paths$cnemc_history,
-    "Use for provenance/revision studies, not as independent repeated observations without version-aware modeling."
+    "Use for provenance/revision studies; this archive intentionally remains source-native."
   ),
   make_inventory_row(
     "onlimo_daily_analysis", onlimo_daily,
     "station_id + date",
-    "Local cumulative archive independently reproduced by retained GitHub daily snapshots",
+    "Local cumulative archive independently reconciled against GitHub snapshots",
     "PASS_CURRENT_OVERLAP",
     paths$onlimo_daily,
-    "Scientific payload agreement is exact for reconciled GitHub keys."
+    "Scientific payload agreement is exact for shared reconciled keys."
   ),
   make_inventory_row(
     "onlimo_historical_analysis", onlimo_historical,
@@ -1507,19 +1675,18 @@ inventory <- bind_rows(
     "Reconstructed from all GitHub immutable historical observation partitions",
     "PASS_PARTIAL_CATCHUP",
     paths$onlimo_hist,
-    "Coverage fields from reconciliation are attached. Restrict descriptive trends to coverage-comparable stations/periods until catch-up completes."
+    "Coverage fields from reconciliation are attached; coverage remains partial until catch-up completes."
   ),
   make_inventory_row(
     "station_metadata", station_metadata,
     "network + station_key",
-    "Unified metadata derived from source masters and station catalog/crosswalk",
+    "Unified metadata derived from source masters, station catalogues and crosswalks",
     "DERIVED_METADATA",
     paths$station,
-    "Fujian recovered coordinates are retained when present in fujian_station_crosswalk.csv."
+    "CNEMC coordinates are attached only from the audited external crosswalk when available."
   )
 )
 
-# Fill primary-key counts explicitly -----------------------------------------
 inventory$distinct_primary_keys[inventory$dataset == "fujian_weekly_analysis"] <-
   n_distinct(fujian$observation_key)
 inventory$distinct_primary_keys[inventory$dataset == "nmemc_marine_analysis"] <-
@@ -1539,7 +1706,7 @@ inventory_path <- file.path(ANALYSIS_DIR, "dataset_inventory.csv")
 write_csv_atomic(inventory, inventory_path)
 
 # ----------------------------------------------------------------------------
-# 15. Build manifest / provenance
+# 16. Build manifest / provenance
 # ----------------------------------------------------------------------------
 if (isTRUE(WRITE_BUILD_MANIFEST)) {
   source_manifest <- tibble(
@@ -1548,6 +1715,7 @@ if (isTRUE(WRITE_BUILD_MANIFEST)) {
       "nmemc_marine_local_master",
       "cnemc_pc_master",
       "cnemc_github_root",
+      "cnemc_coordinate_crosswalk",
       "onlimo_daily_local_archive",
       "onlimo_historical_github_root",
       "onlimo_historical_coverage",
@@ -1558,6 +1726,7 @@ if (isTRUE(WRITE_BUILD_MANIFEST)) {
       NMEMC_MARINE_MASTER,
       CNEMC_PC_MASTER,
       CNEMC_GITHUB_ROOT,
+      CNEMC_COORD_CROSSWALK,
       ONLIMO_DAILY_ARCHIVE,
       ONLIMO_HIST_GITHUB_ROOT,
       ONLIMO_HIST_COVERAGE,
@@ -1570,12 +1739,14 @@ if (isTRUE(WRITE_BUILD_MANIFEST)) {
       built_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S%z")
     )
 
-  build_manifest_path <- file.path(ANALYSIS_DIR, "analysis_build_manifest.csv")
-  write_csv_atomic(source_manifest, build_manifest_path)
+  write_csv_atomic(
+    source_manifest,
+    file.path(ANALYSIS_DIR, "analysis_build_manifest.csv")
+  )
 }
 
 # ----------------------------------------------------------------------------
-# 16. Console summary
+# 17. Console summary
 # ----------------------------------------------------------------------------
 msg("Canonical analysis layer complete.")
 message("")
@@ -1591,6 +1762,7 @@ message("  ONLIMO historical:         ", format(nrow(onlimo_historical), big.mar
 message("  Unified station metadata:  ", format(nrow(station_metadata), big.mark = ","))
 message("")
 message("Station coordinates:")
+
 for (i in seq_len(nrow(station_coordinate_summary))) {
   z <- station_coordinate_summary[i, ]
   message(
@@ -1601,10 +1773,19 @@ for (i in seq_len(nrow(station_coordinate_summary))) {
     if (nzchar(z$coordinate_sources)) paste0(" | ", z$coordinate_sources) else ""
   )
 }
+
+if (file.exists(CNEMC_COORD_CROSSWALK)) {
+  message("  CNEMC coordinate crosswalk: ", CNEMC_COORD_CROSSWALK)
+} else {
+  message("  CNEMC coordinate crosswalk: not yet available")
+}
+
 message("")
 message("Important interpretation rules:")
 message("  - CNEMC latest_analysis = one latest version per observation key.")
-message("  - CNEMC revision_history preserves all reconciled row versions.")
+message("  - CNEMC latest_analysis includes derived readable Chinese and parsed numeric fields.")
+message("  - CNEMC raw columns and hashes remain unchanged.")
+message("  - CNEMC revision_history preserves source-native reconciled row versions.")
 message("  - ONLIMO historical coverage is still partial until GitHub catch-up completes.")
 message("  - Generated analysis files are derived products; keep source archives immutable.")
 
