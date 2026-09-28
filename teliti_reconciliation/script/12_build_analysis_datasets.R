@@ -709,6 +709,26 @@ normalize_fujian_match_key <- function(x) {
   z
 }
 
+canonicalize_fujian_station_identity <- function(x) {
+  # Fujian weekly reports sometimes append temporary operational states to the
+  # station label. These are not new physical stations. Preserve the original
+  # station_name/station_name_raw columns, but remove these suffixes for the
+  # station identity key used by the crosswalk and station metadata.
+  z <- normalize_fujian_station_name(x)
+  if (length(z) == 0L) return(z)
+
+  z <- gsub("（", "(", z, fixed = TRUE)
+  z <- gsub("）", ")", z, fixed = TRUE)
+  z <- sub("\\((更新改造|试运行中|试运行)\\)$", "", z, perl = TRUE)
+
+  # One observed label embeds a descriptive water-source qualifier while the
+  # crosswalk uses the underlying station name. This is an explicit known alias,
+  # not a general rule that removes arbitrary parenthetical text.
+  z <- sub("\\(泉州晋江干流水源地\\)$", "", z, perl = TRUE)
+
+  normalize_fujian_match_key(z)
+}
+
 normalize_source_label <- function(x) {
   z <- trim_na(x)
   if (length(z) == 0L) return(z)
@@ -898,7 +918,7 @@ build_fujian_crosswalk_lookup <- function(path) {
   pieces <- lapply(alias_cols, function(alias_col) {
     tibble(
       cw_row_id = seq_len(nrow(cw)),
-      station_name_key = normalize_fujian_match_key(cw[[alias_col]]),
+      station_name_key = canonicalize_fujian_station_identity(cw[[alias_col]]),
       station_alias_value = as.character(cw[[alias_col]]),
       station_alias_source = alias_col
     ) %>%
@@ -1029,7 +1049,7 @@ build_fujian <- function() {
     arrange(year, week, river_system, station_name) %>%
     mutate(
       analysis_source_basis = source_basis,
-      station_name_key = normalize_fujian_match_key(station_name),
+      station_name_key = canonicalize_fujian_station_identity(station_name),
       station_name_raw_key = normalize_fujian_match_key(station_name_raw)
     )
 
@@ -1044,7 +1064,14 @@ build_fujian <- function() {
   lookup <- build_fujian_crosswalk_lookup(crosswalk_path)
 
   if (!is.null(lookup)) {
-    dat <- dat %>% left_join(lookup, by = "station_name_key")
+    dat <- dat %>%
+      left_join(lookup, by = "station_name_key") %>%
+      mutate(
+        station_name_canonical = dplyr::coalesce(
+          as.character(station_name_crosswalk),
+          as.character(station_name)
+        )
+      )
   } else {
     dat <- dat %>%
       mutate(
@@ -1057,17 +1084,23 @@ build_fujian <- function() {
         station_metadata_source = NA_character_,
         station_alias_value = NA_character_,
         station_alias_source = NA_character_,
-        cw_row_id = NA_integer_
+        cw_row_id = NA_integer_,
+        station_name_canonical = as.character(station_name)
       )
   }
 
   # Station-level matching diagnostics. This is intentionally descriptive:
   # fuzzy/nearest candidates are not auto-assigned.
   diag <- dat %>%
+    filter(!is.na(station_name_key), nzchar(station_name_key)) %>%
     group_by(station_name_key) %>%
     summarise(
-      station_name = first_non_missing_chr(station_name),
+      station_name = first_non_missing_chr(station_name_canonical),
       station_name_raw = first_non_missing_chr(station_name_raw),
+      observed_station_names = paste(
+        sort(unique(stats::na.omit(as.character(station_name)))),
+        collapse = ";"
+      ),
       station_name_crosswalk = first_non_missing_chr(station_name_crosswalk),
       station_alias_value = first_non_missing_chr(station_alias_value),
       station_alias_source = first_non_missing_chr(station_alias_source),
@@ -1581,14 +1614,15 @@ build_station_metadata <- function(fujian, nmemc, cnemc_latest, onlimo_daily, on
 
   # Fujian -------------------------------------------------------------------
   # Coordinates have already been attached at observation level by build_fujian().
-  # Summarise only the 133 observed stations; do not append unmatched crosswalk
-  # rows as if they were monitored stations.
+  # Summarise canonical Fujian station identities after removing temporary
+  # operational-status suffixes; do not append unmatched crosswalk rows as stations.
   fujian_station <- fujian %>%
+    filter(!is.na(station_name_key), nzchar(station_name_key)) %>%
     group_by(station_name_key) %>%
     summarise(
       network = "Fujian weekly",
       station_id = first_non_missing_chr(station_external_id),
-      station_name = first_non_missing_chr(station_name),
+      station_name = first_non_missing_chr(station_name_canonical),
       station_name_en = first_non_missing_chr(station_name_en),
       waterbody = first_non_missing_chr(river_system),
       admin1 = "Fujian",
