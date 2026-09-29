@@ -84,3 +84,9 @@
 !/teliti_reconciliation/script/**
 !/teliti_reconciliation/registry/
 !/teliti_reconciliation/registry/**
+
+# ------------------------------------------------------------
+# 7. Other git
+# ------------------------------------------------------------
+/Comparative/
+/reports/
