@@ -53,24 +53,12 @@ TELITI_DATA_ROOT <- Sys.getenv(
   unset = "D:/# R Project/penelitian"
 )
 
-BASE_DIR <- file.path(
-  TELITI_DATA_ROOT,
-  "nmemc"
-)
+BASE_DIR <- file.path(TELITI_DATA_ROOT, "nmemc")
 
-# Collector/source time and provenance
-COLLECTOR_TZ <- Sys.getenv(
-  "TELITI_TIMEZONE",
-  unset = "Asia/Taipei"
-)
-
+# Collector/source time and provenance.
+COLLECTOR_TZ <- Sys.getenv("TELITI_TIMEZONE", unset = "Asia/Taipei")
 SOURCE_TZ <- "Asia/Shanghai"
-
-COLLECTOR_ID <- Sys.getenv(
-  "TELITI_COLLECTOR_ID",
-  unset = "local_pc"
-)
-
+COLLECTOR_ID <- Sys.getenv("TELITI_COLLECTOR_ID", unset = "local_pc")
 GITHUB_RUN_ID <- Sys.getenv("GITHUB_RUN_ID", unset = "")
 GITHUB_RUN_ATTEMPT <- Sys.getenv("GITHUB_RUN_ATTEMPT", unset = "")
 GITHUB_SHA <- Sys.getenv("GITHUB_SHA", unset = "")
@@ -79,14 +67,29 @@ MAIN_URL <- "https://szzdjc.cnemc.cn:8070/GJZ/Business/Publish/Main.html"
 ENDPOINT <- "https://szzdjc.cnemc.cn:8070/GJZ/Ajax/Publish.ashx"
 ORIGIN   <- "https://szzdjc.cnemc.cn:8070"
 
+# The public application currently returns a plain-text -1 when getRealDatas
+# is called cold. A browser-like warm-up sequence (Main.html, then
+# getArea_RiverDic, then getRealDatas) restores the expected JSON response.
+# Keep a temporary cookie jar even though the site did not issue cookies in the
+# 2026-09-29 diagnostic; this preserves compatibility if that changes later.
+BROWSER_USER_AGENT <- paste(
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+  "AppleWebKit/537.36 (KHTML, like Gecko)",
+  "Chrome/140.0.0.0 Safari/537.36"
+)
+
 SURFACE_DIR   <- file.path(BASE_DIR, "data", "surfacewater")
 SOURCE_DIR    <- file.path(SURFACE_DIR, "source")
 ARCHIVE_DIR   <- file.path(SURFACE_DIR, "archive")
 PROCESSED_DIR <- file.path(SURFACE_DIR, "processed")
 LOG_DIR       <- file.path(BASE_DIR, "log")
 SCRIPT_DIR    <- file.path(BASE_DIR, "script")
+FAILED_RESPONSE_DIR <- file.path(LOG_DIR, "failed_responses")
 
-for (d in c(SURFACE_DIR, SOURCE_DIR, ARCHIVE_DIR, PROCESSED_DIR, LOG_DIR, SCRIPT_DIR)) {
+for (d in c(
+  SURFACE_DIR, SOURCE_DIR, ARCHIVE_DIR, PROCESSED_DIR, LOG_DIR, SCRIPT_DIR,
+  FAILED_RESPONSE_DIR
+)) {
   dir.create(d, recursive = TRUE, showWarnings = FALSE)
 }
 
@@ -103,25 +106,35 @@ MN_NAME  <- as.character(getOption("nmemc.surfacewater.mn_name", ""))
 PAGE_DELAY_SECONDS <- suppressWarnings(as.numeric(getOption("nmemc.surfacewater.page_delay", 0.25)))
 if (is.na(PAGE_DELAY_SECONDS) || PAGE_DELAY_SECONDS < 0) PAGE_DELAY_SECONDS <- 0.25
 
-# HTTP-level retries do not catch a structurally valid HTTP 200 response whose
-# nationwide table is temporarily empty (observed during source rollover).
-# Retry the complete fetch+parse transaction separately for that semantic case.
+# Keep the HTTP layer short and bounded. A complete snapshot has its own retry
+# loop below, so very long nested HTTP retries only consume the workflow budget.
+HTTP_TIMEOUT_SECONDS <- suppressWarnings(as.numeric(
+  getOption("nmemc.surfacewater.http_timeout_seconds", 30)
+))
+if (!is.finite(HTTP_TIMEOUT_SECONDS) || HTTP_TIMEOUT_SECONDS <= 0) {
+  HTTP_TIMEOUT_SECONDS <- 30
+}
+
+HTTP_MAX_TRIES <- suppressWarnings(as.integer(
+  getOption("nmemc.surfacewater.http_max_tries", 2L)
+))
+if (is.na(HTTP_MAX_TRIES) || HTTP_MAX_TRIES < 1L) HTTP_MAX_TRIES <- 2L
+
+# Retry the complete fetch+parse transaction for semantic source failures such
+# as a valid HTTP response containing an empty or otherwise invalid snapshot.
 SNAPSHOT_MAX_ATTEMPTS <- suppressWarnings(as.integer(
   getOption("nmemc.surfacewater.snapshot_max_attempts", 3L)
 ))
-if (is.na(SNAPSHOT_MAX_ATTEMPTS) || SNAPSHOT_MAX_ATTEMPTS < 1L) SNAPSHOT_MAX_ATTEMPTS <- 3L
+if (is.na(SNAPSHOT_MAX_ATTEMPTS) || SNAPSHOT_MAX_ATTEMPTS < 1L) {
+  SNAPSHOT_MAX_ATTEMPTS <- 3L
+}
 
 SNAPSHOT_RETRY_SECONDS <- suppressWarnings(as.numeric(
-  getOption("nmemc.surfacewater.snapshot_retry_seconds", c(20, 60))
+  getOption("nmemc.surfacewater.snapshot_retry_seconds", c(10, 30))
 ))
 SNAPSHOT_RETRY_SECONDS <- SNAPSHOT_RETRY_SECONDS[
   is.finite(SNAPSHOT_RETRY_SECONDS) & SNAPSHOT_RETRY_SECONDS >= 0
 ]
-
-sprintf(
-  "nmemc_surfacewater_%s.log",
-  format(Sys.time(), "%Y%m%d", tz = COLLECTOR_TZ)
-)
 
 log_file <- file.path(
   LOG_DIR,
@@ -135,17 +148,13 @@ log_msg <- function(...) {
   msg <- paste0(...)
   line <- sprintf(
     "%s | %s",
-    format(
-      Sys.time(),
-      "%Y-%m-%d %H:%M:%S",
-      tz = COLLECTOR_TZ
-    ),
+    format(Sys.time(), "%Y-%m-%d %H:%M:%S", tz = COLLECTOR_TZ),
     msg
   )
-
   cat(line, "\n")
   cat(line, "\n", file = log_file, append = TRUE)
 }
+
 # -----------------------------
 # 2. Package checks
 # -----------------------------
@@ -174,6 +183,7 @@ master_rds_path <- file.path(PROCESSED_DIR, "nmemc_surfacewater_observations.rds
 master_csv_path <- file.path(PROCESSED_DIR, "nmemc_surfacewater_observations.csv.gz")
 header_dictionary_path <- file.path(PROCESSED_DIR, "nmemc_surfacewater_header_dictionary.csv")
 run_manifest_path <- file.path(PROCESSED_DIR, "nmemc_surfacewater_run_manifest.csv")
+failure_manifest_path <- file.path(LOG_DIR, "nmemc_surfacewater_failure_manifest.csv")
 
 write_raw_atomic <- function(raw_body, destination) {
   tmp <- tempfile(pattern = "nmemc_surface_", tmpdir = dirname(destination))
@@ -225,6 +235,105 @@ raw_to_utf8 <- function(x) {
 safe_chr <- function(x) {
   if (is.null(x) || length(x) == 0L) return(NA_character_)
   as.character(x[[1]])
+}
+
+cnemc_stop <- function(failure_type, message) {
+  cond <- structure(
+    list(message = as.character(message), call = NULL, failure_type = failure_type),
+    class = c("cnemc_collection_error", "error", "condition")
+  )
+  stop(cond)
+}
+
+classify_collection_error <- function(e) {
+  if (inherits(e, "cnemc_collection_error") && !is.null(e$failure_type)) {
+    return(as.character(e$failure_type))
+  }
+
+  msg <- conditionMessage(e)
+  if (grepl("timed out|timeout", msg, ignore.case = TRUE)) return("transport_timeout")
+  if (grepl(
+    "empty reply|server returned nothing|failed to perform http request|curl_fetch|connection reset|could not resolve|couldn't connect",
+    msg, ignore.case = TRUE
+  )) return("transport_failure")
+  if (grepl("HTTP [45][0-9][0-9]", msg, ignore.case = TRUE)) return("http_error")
+  "unclassified_error"
+}
+
+body_preview <- function(raw_body, max_chars = 500L) {
+  if (is.null(raw_body) || length(raw_body) == 0L) return("<empty body>")
+  txt <- tryCatch(
+    raw_to_utf8(raw_body),
+    error = function(e) {
+      n <- min(length(raw_body), 128L)
+      paste(sprintf("%02X", as.integer(raw_body[seq_len(n)])), collapse = " ")
+    }
+  )
+  txt <- gsub("[\r\n\t]+", " ", txt, perl = TRUE)
+  txt <- gsub("\\s+", " ", txt, perl = TRUE)
+  txt <- trimws(txt)
+  if (!nzchar(txt)) return("<empty text body>")
+  substr(txt, 1L, max_chars)
+}
+
+save_failed_response <- function(
+  raw_body, failure_type, page_index = NA_integer_, snapshot_attempt = NA_integer_,
+  status = NA_integer_, content_type = NA_character_, server_date = NA_character_
+) {
+  stamp <- format(Sys.time(), "%Y%m%d_%H%M%S", tz = COLLECTOR_TZ)
+  page_tag <- if (is.na(page_index)) "pageNA" else sprintf("page%02d", page_index)
+  attempt_tag <- if (is.na(snapshot_attempt)) "attemptNA" else sprintf("attempt%02d", snapshot_attempt)
+  base <- paste("cnemc", stamp, attempt_tag, page_tag, failure_type, sep = "_")
+
+  raw_path <- file.path(FAILED_RESPONSE_DIR, paste0(base, ".raw"))
+  meta_path <- file.path(FAILED_RESPONSE_DIR, paste0(base, ".txt"))
+
+  if (!is.null(raw_body)) write_raw_atomic(raw_body, raw_path)
+
+  meta <- c(
+    paste0("failure_type=", failure_type),
+    paste0("snapshot_attempt=", snapshot_attempt),
+    paste0("page_index=", page_index),
+    paste0("http_status=", status),
+    paste0("content_type=", content_type),
+    paste0("server_date=", server_date),
+    paste0("body_bytes=", if (is.null(raw_body)) 0L else length(raw_body)),
+    paste0("body_preview=", body_preview(raw_body))
+  )
+  writeLines(meta, meta_path, useBytes = TRUE)
+
+  log_msg(
+    "Saved failed CNEMC response: type=", failure_type,
+    "; status=", status,
+    "; content_type=", content_type,
+    "; bytes=", if (is.null(raw_body)) 0L else length(raw_body),
+    "; preview=", body_preview(raw_body),
+    "; raw=", basename(raw_path)
+  )
+  invisible(raw_path)
+}
+
+append_failure_manifest <- function(attempt, failure_type, message) {
+  entry <- tibble::tibble(
+    failed_at = as.POSIXct(Sys.time(), tz = COLLECTOR_TZ),
+    collector_id = COLLECTOR_ID,
+    github_run_id = if (nzchar(GITHUB_RUN_ID)) GITHUB_RUN_ID else NA_character_,
+    github_run_attempt = if (nzchar(GITHUB_RUN_ATTEMPT)) GITHUB_RUN_ATTEMPT else NA_character_,
+    scraper_code_commit = if (nzchar(GITHUB_SHA)) GITHUB_SHA else NA_character_,
+    snapshot_attempt = as.integer(attempt),
+    failure_type = as.character(failure_type),
+    message = as.character(message),
+    endpoint = ENDPOINT
+  )
+
+  if (file.exists(failure_manifest_path)) {
+    old <- suppressWarnings(readr::read_csv(failure_manifest_path, show_col_types = FALSE))
+    out <- dplyr::bind_rows(old, entry)
+  } else {
+    out <- entry
+  }
+  readr::write_csv(out, failure_manifest_path, na = "")
+  invisible(entry)
 }
 
 # CNEMC publishes monitoring time as MM-DD HH:MM without the year.
@@ -313,21 +422,178 @@ recompute_observation_hashes <- function(dat, source_cols) {
 # -----------------------------
 # 4. HTTP requests
 # -----------------------------
-base_request <- function() {
-  httr2::request(ENDPOINT) |>
-    httr2::req_user_agent("Mozilla/5.0 (compatible; academic-research/CNEMC-surface-water-archive)") |>
+add_cookie_jar <- function(req, cookie_file = NULL) {
+  if (!is.null(cookie_file) && length(cookie_file) == 1L && nzchar(cookie_file)) {
+    req <- httr2::req_cookie_preserve(req, cookie_file)
+  }
+  req
+}
+
+base_request <- function(cookie_file = NULL) {
+  req <- httr2::request(ENDPOINT) |>
+    httr2::req_user_agent(BROWSER_USER_AGENT) |>
     httr2::req_headers(
       Referer = MAIN_URL,
       Origin = ORIGIN,
       Accept = "application/json, text/javascript, */*; q=0.01",
-      `X-Requested-With` = "XMLHttpRequest"
-    ) |>
-    httr2::req_timeout(90) |>
-    httr2::req_retry(max_tries = 4, retry_on_failure = TRUE)
+      `Accept-Language` = "zh-CN,zh;q=0.9,en;q=0.8",
+      `X-Requested-With` = "XMLHttpRequest",
+      `Cache-Control` = "no-cache",
+      Pragma = "no-cache"
+    )
+
+  req <- add_cookie_jar(req, cookie_file)
+
+  req |>
+    httr2::req_timeout(HTTP_TIMEOUT_SECONDS) |>
+    httr2::req_retry(max_tries = HTTP_MAX_TRIES, retry_on_failure = TRUE)
 }
 
-fetch_page_raw <- function(page_index, page_size = PAGE_SIZE) {
-  req <- base_request() |>
+main_page_request <- function(cookie_file = NULL) {
+  req <- httr2::request(MAIN_URL) |>
+    httr2::req_user_agent(BROWSER_USER_AGENT) |>
+    httr2::req_headers(
+      Accept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      `Accept-Language` = "zh-CN,zh;q=0.9,en;q=0.8",
+      `Cache-Control` = "no-cache",
+      Pragma = "no-cache"
+    )
+
+  req <- add_cookie_jar(req, cookie_file)
+
+  req |>
+    httr2::req_timeout(HTTP_TIMEOUT_SECONDS) |>
+    httr2::req_retry(max_tries = HTTP_MAX_TRIES, retry_on_failure = TRUE)
+}
+
+perform_request_or_stop <- function(req, context) {
+  tryCatch(
+    httr2::req_perform(req),
+    error = function(e) {
+      cnemc_stop(
+        classify_collection_error(e),
+        paste0(context, ": ", conditionMessage(e))
+      )
+    }
+  )
+}
+
+warm_cnemc_application <- function(cookie_file, snapshot_attempt = NA_integer_) {
+  log_msg("Initializing CNEMC application: Main.html -> getArea_RiverDic")
+
+  main_resp <- perform_request_or_stop(
+    main_page_request(cookie_file),
+    "CNEMC Main.html warm-up failed"
+  )
+  main_status <- httr2::resp_status(main_resp)
+  main_body <- httr2::resp_body_raw(main_resp)
+  main_type <- safe_chr(httr2::resp_header(main_resp, "content-type"))
+  main_date <- safe_chr(httr2::resp_header(main_resp, "date"))
+
+  if (main_status < 200L || main_status >= 300L) {
+    save_failed_response(
+      raw_body = main_body,
+      failure_type = "warmup_main_http_error",
+      page_index = NA_integer_,
+      snapshot_attempt = snapshot_attempt,
+      status = main_status,
+      content_type = main_type,
+      server_date = main_date
+    )
+    cnemc_stop(
+      "warmup_main_http_error",
+      paste0("CNEMC Main.html warm-up returned HTTP ", main_status)
+    )
+  }
+
+  dic_req <- base_request(cookie_file) |>
+    httr2::req_body_form(action = "getArea_RiverDic")
+
+  dic_resp <- perform_request_or_stop(
+    dic_req,
+    "CNEMC getArea_RiverDic warm-up failed"
+  )
+  dic_status <- httr2::resp_status(dic_resp)
+  dic_body <- httr2::resp_body_raw(dic_resp)
+  dic_type <- safe_chr(httr2::resp_header(dic_resp, "content-type"))
+  dic_date <- safe_chr(httr2::resp_header(dic_resp, "date"))
+
+  if (dic_status < 200L || dic_status >= 300L) {
+    save_failed_response(
+      raw_body = dic_body,
+      failure_type = "warmup_dictionary_http_error",
+      page_index = NA_integer_,
+      snapshot_attempt = snapshot_attempt,
+      status = dic_status,
+      content_type = dic_type,
+      server_date = dic_date
+    )
+    cnemc_stop(
+      "warmup_dictionary_http_error",
+      paste0("CNEMC getArea_RiverDic warm-up returned HTTP ", dic_status)
+    )
+  }
+
+  dic_text <- tryCatch(
+    raw_to_utf8(dic_body),
+    error = function(e) {
+      save_failed_response(
+        dic_body, "warmup_dictionary_invalid_body", NA_integer_, snapshot_attempt,
+        dic_status, dic_type, dic_date
+      )
+      cnemc_stop(
+        "warmup_dictionary_invalid_body",
+        paste0("Could not decode getArea_RiverDic response: ", conditionMessage(e))
+      )
+    }
+  )
+
+  dic_parsed <- tryCatch(
+    jsonlite::fromJSON(dic_text, simplifyVector = FALSE),
+    error = function(e) {
+      save_failed_response(
+        dic_body, "warmup_dictionary_invalid_json", NA_integer_, snapshot_attempt,
+        dic_status, dic_type, dic_date
+      )
+      cnemc_stop(
+        "warmup_dictionary_invalid_json",
+        paste0("Could not parse getArea_RiverDic JSON: ", conditionMessage(e))
+      )
+    }
+  )
+
+  if (!is.list(dic_parsed)) {
+    save_failed_response(
+      dic_body, "warmup_dictionary_unexpected_payload", NA_integer_, snapshot_attempt,
+      dic_status, dic_type, dic_date
+    )
+    cnemc_stop(
+      "warmup_dictionary_unexpected_payload",
+      paste0(
+        "Unexpected getArea_RiverDic response; body preview: ",
+        body_preview(dic_body)
+      )
+    )
+  }
+
+  log_msg(
+    "CNEMC application initialized: Main.html status=", main_status,
+    "; area-river entries=", length(dic_parsed)
+  )
+
+  list(
+    main_status = main_status,
+    area_river_status = dic_status,
+    area_river_body = dic_body,
+    area_river_md5 = md5_raw(dic_body)
+  )
+}
+
+fetch_page_raw <- function(
+  page_index, page_size = PAGE_SIZE, snapshot_attempt = NA_integer_,
+  cookie_file = NULL
+) {
+  req <- base_request(cookie_file) |>
     httr2::req_body_form(
       AreaID = AREA_ID,
       RiverID = RIVER_ID,
@@ -337,69 +603,156 @@ fetch_page_raw <- function(page_index, page_size = PAGE_SIZE) {
       action = "getRealDatas"
     )
 
-  resp <- httr2::req_perform(req)
+  resp <- perform_request_or_stop(
+    req,
+    paste0("CNEMC getRealDatas page ", page_index, " request failed")
+  )
+
   status <- httr2::resp_status(resp)
+  raw_body <- httr2::resp_body_raw(resp)
+  content_type <- safe_chr(httr2::resp_header(resp, "content-type"))
+  server_date <- safe_chr(httr2::resp_header(resp, "date"))
+
   if (status < 200L || status >= 300L) {
-    stop("HTTP ", status, " while retrieving page ", page_index)
+    save_failed_response(
+      raw_body = raw_body,
+      failure_type = "http_error",
+      page_index = page_index,
+      snapshot_attempt = snapshot_attempt,
+      status = status,
+      content_type = content_type,
+      server_date = server_date
+    )
+    cnemc_stop("http_error", paste0("HTTP ", status, " while retrieving page ", page_index))
   }
 
   list(
     page_index = as.integer(page_index),
     status = status,
-    body = httr2::resp_body_raw(resp),
-    content_type = safe_chr(httr2::resp_header(resp, "content-type")),
-    server_date = safe_chr(httr2::resp_header(resp, "date"))
+    body = raw_body,
+    content_type = content_type,
+    server_date = server_date
   )
 }
 
-parse_api_page <- function(raw_body, page_index = NA_integer_) {
-  txt <- raw_to_utf8(raw_body)
+parse_api_page <- function(
+  raw_body, page_index = NA_integer_, response_meta = NULL, snapshot_attempt = NA_integer_
+) {
+  status <- if (is.null(response_meta$status)) NA_integer_ else response_meta$status
+  content_type <- if (is.null(response_meta$content_type)) NA_character_ else response_meta$content_type
+  server_date <- if (is.null(response_meta$server_date)) NA_character_ else response_meta$server_date
+
+  txt <- tryCatch(
+    raw_to_utf8(raw_body),
+    error = function(e) {
+      save_failed_response(
+        raw_body, "invalid_body_encoding", page_index, snapshot_attempt,
+        status, content_type, server_date
+      )
+      cnemc_stop(
+        "invalid_body_encoding",
+        paste0("Could not decode API response on page ", page_index, ": ", conditionMessage(e))
+      )
+    }
+  )
 
   out <- tryCatch(
     jsonlite::fromJSON(txt, simplifyVector = FALSE),
     error = function(e) {
-      stop("Could not parse API JSON on page ", page_index, ": ", conditionMessage(e))
+      save_failed_response(
+        raw_body, "invalid_json", page_index, snapshot_attempt,
+        status, content_type, server_date
+      )
+      cnemc_stop(
+        "invalid_json",
+        paste0("Could not parse API JSON on page ", page_index, ": ", conditionMessage(e))
+      )
     }
   )
 
-  if (!is.list(out)) stop("Unexpected API response type on page ", page_index)
+  if (!is.list(out)) {
+    save_failed_response(
+      raw_body, "unexpected_payload", page_index, snapshot_attempt,
+      status, content_type, server_date
+    )
+    cnemc_stop(
+      "unexpected_payload",
+      paste0(
+        "Unexpected API response type on page ", page_index,
+        "; body preview: ", body_preview(raw_body)
+      )
+    )
+  }
 
   # The public JavaScript tests data.result before using the response.
   result_value <- out$result
-  result_ok <- !is.null(result_value) && length(result_value) > 0L &&
-    !identical(as.character(result_value[[1]]), "0") &&
-    !identical(as.character(result_value[[1]]), "false")
+  result_text <- if (is.null(result_value) || length(result_value) == 0L) {
+    NA_character_
+  } else {
+    tolower(as.character(result_value[[1]]))
+  }
+  result_ok <- !is.na(result_text) && !result_text %in% c("0", "false")
 
   if (!result_ok) {
-    stop("API returned result=0/false on page ", page_index)
+    save_failed_response(
+      raw_body, "api_result_false", page_index, snapshot_attempt,
+      status, content_type, server_date
+    )
+    cnemc_stop(
+      "api_result_false",
+      paste0("API returned result=0/false/missing on page ", page_index)
+    )
   }
 
   headers <- unlist(out$thead, use.names = FALSE)
   rows <- out$tbody
   total_pages <- suppressWarnings(as.integer(unlist(out$total, use.names = FALSE)[1]))
   if (is.na(total_pages) || total_pages < 1L) total_pages <- 1L
+  reported_records <- suppressWarnings(as.integer(unlist(out$records, use.names = FALSE)[1]))
+  if (length(reported_records) == 0L || is.na(reported_records)) reported_records <- NA_integer_
 
   list(
     headers = as.character(headers),
     rows = rows,
     total_pages = total_pages,
+    reported_records = reported_records,
     result = result_value
   )
 }
 
-fetch_snapshot <- function() {
+fetch_snapshot <- function(snapshot_attempt = NA_integer_) {
   run_time <- Sys.time()
+  cookie_file <- tempfile("cnemc_cookie_jar_", fileext = ".txt")
+  on.exit(unlink(cookie_file), add = TRUE)
+
   log_msg("Checking live nationwide surface-water endpoint")
   log_msg(
     "Request filter: AreaID='", AREA_ID, "'; RiverID='", RIVER_ID,
     "'; MNName='", MN_NAME, "'; PageSize=", PAGE_SIZE
   )
 
-  first <- fetch_page_raw(1L)
-  first_parsed <- parse_api_page(first$body, 1L)
-  total_pages <- first_parsed$total_pages
+  # CNEMC currently requires this browser-like application initialization.
+  # A cold getRealDatas request returns HTTP 200 text/plain with body "-1".
+  warmup <- warm_cnemc_application(
+    cookie_file = cookie_file,
+    snapshot_attempt = snapshot_attempt
+  )
 
-  log_msg("Endpoint reports ", total_pages, " page(s) at PageSize=", PAGE_SIZE)
+  first <- fetch_page_raw(
+    1L,
+    snapshot_attempt = snapshot_attempt,
+    cookie_file = cookie_file
+  )
+  first_parsed <- parse_api_page(
+    first$body, 1L, response_meta = first, snapshot_attempt = snapshot_attempt
+  )
+  total_pages <- first_parsed$total_pages
+  reported_records <- first_parsed$reported_records
+
+  log_msg(
+    "Endpoint reports ", total_pages, " page(s) at PageSize=", PAGE_SIZE,
+    if (!is.na(reported_records)) paste0("; records=", reported_records) else ""
+  )
 
   pages <- vector("list", total_pages)
   pages[[1]] <- first
@@ -408,7 +761,11 @@ fetch_snapshot <- function() {
     for (i in 2:total_pages) {
       if (PAGE_DELAY_SECONDS > 0) Sys.sleep(PAGE_DELAY_SECONDS)
       log_msg("Fetching page ", i, "/", total_pages)
-      pages[[i]] <- fetch_page_raw(i)
+      pages[[i]] <- fetch_page_raw(
+        i,
+        snapshot_attempt = snapshot_attempt,
+        cookie_file = cookie_file
+      )
     }
   }
 
@@ -423,11 +780,15 @@ fetch_snapshot <- function() {
       AreaID = AREA_ID,
       RiverID = RIVER_ID,
       MNName = MN_NAME,
-      PageSize = PAGE_SIZE
+      PageSize = PAGE_SIZE,
+      initialization = c("Main.html", "getArea_RiverDic", "getRealDatas")
     ),
+    warmup = warmup,
     total_pages = total_pages,
+    reported_records = reported_records,
     page_md5 = page_md5,
     snapshot_md5 = snapshot_md5,
+    snapshot_attempt = snapshot_attempt,
     pages = pages
   )
 }
@@ -511,10 +872,22 @@ decode_water_class <- function(x) {
 }
 
 parse_snapshot <- function(bundle) {
-  parsed <- lapply(bundle$pages, function(pg) parse_api_page(pg$body, pg$page_index))
+  parsed <- lapply(
+    bundle$pages,
+    function(pg) parse_api_page(
+      pg$body, pg$page_index, response_meta = pg,
+      snapshot_attempt = bundle$snapshot_attempt
+    )
+  )
 
   headers <- parsed[[1]]$headers
-  if (length(headers) == 0L) stop("API supplied no table headers")
+  if (length(headers) == 0L) {
+    save_failed_response(
+      bundle$pages[[1]]$body, "schema_error", 1L, bundle$snapshot_attempt,
+      bundle$pages[[1]]$status, bundle$pages[[1]]$content_type, bundle$pages[[1]]$server_date
+    )
+    cnemc_stop("schema_error", "API supplied no table headers")
+  }
 
   # Verify that all pages describe the same table schema.
   same_headers <- vapply(
@@ -525,7 +898,10 @@ parse_snapshot <- function(bundle) {
     logical(1)
   )
   if (!all(same_headers)) {
-    stop("Table headers changed between pages during the same collection run")
+    cnemc_stop(
+      "schema_error",
+      "Table headers changed between pages during the same collection run"
+    )
   }
 
   dictionary <- make_header_dictionary(headers)
@@ -552,14 +928,36 @@ parse_snapshot <- function(bundle) {
 
   dat <- dplyr::bind_rows(page_frames)
 
-  # A nationwide request should never become a canonical snapshot when the API
-  # reports success but supplies zero data rows. Treat this as a transient
-  # semantic source failure so collect_valid_snapshot() can retry the full run.
+  # The endpoint also exposes a `records` field. Its semantics may include
+  # registered sections that are not represented in the current tbody, so a
+  # difference is logged for provenance but is not automatically treated as a
+  # failed snapshot.
+  reported_records <- if (!is.null(bundle$reported_records)) {
+    suppressWarnings(as.integer(bundle$reported_records[[1]]))
+  } else {
+    NA_integer_
+  }
+  if (!is.na(reported_records) && reported_records != nrow(dat)) {
+    log_msg(
+      "NOTICE CNEMC records/tbody difference: API records=", reported_records,
+      "; returned tbody rows=", nrow(dat),
+      "; difference=", reported_records - nrow(dat)
+    )
+  }
+
+  # A nationwide request should never become canonical when a structurally
+  # valid response contains zero data rows. Preserve the response and retry the
+  # complete transaction rather than overwriting the current archive.
   if (nrow(dat) == 0L) {
-    stop(
-      "CNEMC API returned a successful response with zero data rows; ",
-      "treating this as a transient invalid snapshot",
-      call. = FALSE
+    for (pg in bundle$pages) {
+      save_failed_response(
+        pg$body, "valid_zero_rows", pg$page_index, bundle$snapshot_attempt,
+        pg$status, pg$content_type, pg$server_date
+      )
+    }
+    cnemc_stop(
+      "valid_zero_rows",
+      "CNEMC API returned a successful response with zero data rows; treating this as a transient invalid snapshot"
     )
   }
 
@@ -580,24 +978,9 @@ parse_snapshot <- function(bundle) {
   # archiving while monitoring_time_raw remains untouched.
   dat <- recompute_observation_hashes(dat, source_cols)
   dat$collector_id <- COLLECTOR_ID
-
-dat$github_run_id <- if (nzchar(GITHUB_RUN_ID)) {
-  GITHUB_RUN_ID
-} else {
-  NA_character_
-}
-
-dat$github_run_attempt <- if (nzchar(GITHUB_RUN_ATTEMPT)) {
-  GITHUB_RUN_ATTEMPT
-} else {
-  NA_character_
-}
-
-dat$scraper_code_commit <- if (nzchar(GITHUB_SHA)) {
-  GITHUB_SHA
-} else {
-  NA_character_
-}
+  dat$github_run_id <- if (nzchar(GITHUB_RUN_ID)) GITHUB_RUN_ID else NA_character_
+  dat$github_run_attempt <- if (nzchar(GITHUB_RUN_ATTEMPT)) GITHUB_RUN_ATTEMPT else NA_character_
+  dat$scraper_code_commit <- if (nzchar(GITHUB_SHA)) GITHUB_SHA else NA_character_
 
   list(data = tibble::as_tibble(dat), dictionary = dictionary)
 }
@@ -630,7 +1013,7 @@ collect_valid_snapshot <- function() {
 
     attempt_result <- tryCatch(
       {
-        bundle <- fetch_snapshot()
+        bundle <- fetch_snapshot(snapshot_attempt = attempt)
         parsed <- parse_snapshot(bundle)
 
         log_msg(
@@ -649,16 +1032,20 @@ collect_valid_snapshot <- function() {
     if (isTRUE(attempt_result$ok)) return(attempt_result)
 
     last_error <- attempt_result$error
+    failure_type <- classify_collection_error(last_error)
+    append_failure_manifest(attempt, failure_type, conditionMessage(last_error))
     log_msg(
       "WARNING CNEMC snapshot attempt ", attempt, "/", SNAPSHOT_MAX_ATTEMPTS,
-      " failed: ", conditionMessage(last_error)
+      " failed [", failure_type, "]: ", conditionMessage(last_error)
     )
   }
 
-  stop(
-    "CNEMC snapshot failed after ", SNAPSHOT_MAX_ATTEMPTS,
-    " full attempt(s): ", conditionMessage(last_error),
-    call. = FALSE
+  cnemc_stop(
+    classify_collection_error(last_error),
+    paste0(
+      "CNEMC snapshot failed after ", SNAPSHOT_MAX_ATTEMPTS,
+      " full attempt(s): ", conditionMessage(last_error)
+    )
   )
 }
 
@@ -675,16 +1062,8 @@ archive_snapshot_if_changed <- function(bundle) {
   changed <- is.na(old_md5) || !identical(old_md5, bundle$snapshot_md5)
 
   if (changed) {
-stamp <- format(
-  bundle$collected_at,
-  "%Y%m%d_%H%M%S",
-  tz = COLLECTOR_TZ
-)
-
-year_dir <- file.path(
-  ARCHIVE_DIR,
-  format(bundle$collected_at, "%Y", tz = COLLECTOR_TZ)
-)
+    stamp <- format(bundle$collected_at, "%Y%m%d_%H%M%S", tz = COLLECTOR_TZ)
+    year_dir <- file.path(ARCHIVE_DIR, format(bundle$collected_at, "%Y", tz = COLLECTOR_TZ))
     dir.create(year_dir, recursive = TRUE, showWarnings = FALSE)
     archive_path <- file.path(year_dir, sprintf("surfacewater_%s_raw.rds", stamp))
     saveRDS(bundle, archive_path, compress = "xz")
@@ -714,32 +1093,18 @@ year_dir <- file.path(
   changed
 }
 
-fetch_area_river_dictionary <- function() {
-  req <- base_request() |>
-    httr2::req_body_form(action = "getArea_RiverDic")
-
-  resp <- httr2::req_perform(req)
-  if (httr2::resp_status(resp) < 200L || httr2::resp_status(resp) >= 300L) {
-    stop("Area-river dictionary HTTP status ", httr2::resp_status(resp))
+archive_area_river_dictionary <- function(raw_body) {
+  if (is.null(raw_body) || length(raw_body) == 0L) {
+    stop("Area-river dictionary body is empty")
   }
 
-  raw_body <- httr2::resp_body_raw(resp)
   new_md5 <- md5_raw(raw_body)
   old_md5 <- if (file.exists(area_river_path)) unname(tools::md5sum(area_river_path)) else NA_character_
 
   if (is.na(old_md5) || !identical(old_md5, new_md5)) {
-now <- Sys.time()
-
-stamp <- format(
-  now,
-  "%Y%m%d_%H%M%S",
-  tz = COLLECTOR_TZ
-)
-
-year_dir <- file.path(
-  ARCHIVE_DIR,
-  format(now, "%Y", tz = COLLECTOR_TZ)
-)
+    now <- Sys.time()
+    stamp <- format(now, "%Y%m%d_%H%M%S", tz = COLLECTOR_TZ)
+    year_dir <- file.path(ARCHIVE_DIR, format(now, "%Y", tz = COLLECTOR_TZ))
     dir.create(year_dir, recursive = TRUE, showWarnings = FALSE)
     archive_path <- file.path(year_dir, sprintf("area_river_%s.json", stamp))
     write_raw_atomic(raw_body, archive_path)
@@ -838,14 +1203,15 @@ update_cumulative_master <- function(snapshot_data, run_time, source_cols) {
 append_run_manifest <- function(bundle, parsed, changed) {
   entry <- tibble::tibble(
     collector_id = COLLECTOR_ID,
-github_run_id = if (nzchar(GITHUB_RUN_ID)) GITHUB_RUN_ID else NA_character_,
-github_run_attempt = if (nzchar(GITHUB_RUN_ATTEMPT)) GITHUB_RUN_ATTEMPT else NA_character_,
-scraper_code_commit = if (nzchar(GITHUB_SHA)) GITHUB_SHA else NA_character_,
+    github_run_id = if (nzchar(GITHUB_RUN_ID)) GITHUB_RUN_ID else NA_character_,
+    github_run_attempt = if (nzchar(GITHUB_RUN_ATTEMPT)) GITHUB_RUN_ATTEMPT else NA_character_,
+    scraper_code_commit = if (nzchar(GITHUB_SHA)) GITHUB_SHA else NA_character_,
     collected_at = as.POSIXct(bundle$collected_at, tz = COLLECTOR_TZ),
     snapshot_md5 = bundle$snapshot_md5,
     changed = isTRUE(changed),
     total_pages = as.integer(bundle$total_pages),
     page_size = as.integer(PAGE_SIZE),
+    reported_records = if (!is.null(bundle$reported_records)) as.integer(bundle$reported_records) else NA_integer_,
     rows = nrow(parsed$data),
     unique_row_hashes = dplyr::n_distinct(parsed$data$row_hash),
     area_id = AREA_ID,
@@ -869,11 +1235,20 @@ scraper_code_commit = if (nzchar(GITHUB_SHA)) GITHUB_SHA else NA_character_,
 # -----------------------------
 log_msg("START CNEMC surface-water archive")
 log_msg("Source page: ", MAIN_URL)
+log_msg(
+  "Retry budget: HTTP timeout=", HTTP_TIMEOUT_SECONDS, "s; HTTP tries=",
+  HTTP_MAX_TRIES, "; snapshot attempts=", SNAPSHOT_MAX_ATTEMPTS,
+  "; snapshot waits=", paste(SNAPSHOT_RETRY_SECONDS, collapse = ","), "s"
+)
+log_msg("Request initialization: Main.html -> getArea_RiverDic -> getRealDatas")
 
 collection <- tryCatch(
   collect_valid_snapshot(),
   error = function(e) {
-    log_msg("FATAL CNEMC collection error: ", conditionMessage(e))
+    log_msg(
+      "FATAL CNEMC collection error [", classify_collection_error(e), "]: ",
+      conditionMessage(e)
+    )
     stop(e)
   }
 )
@@ -893,10 +1268,12 @@ update_cumulative_master(
 )
 append_run_manifest(bundle, parsed, changed)
 
-# Metadata dictionary is useful but should not cause the main data run to fail.
+# The successful snapshot attempt already fetched the dictionary during the
+# required application warm-up. Archive that exact response instead of making
+# another network request after collection.
 tryCatch(
-  fetch_area_river_dictionary(),
-  error = function(e) log_msg("WARNING area-river dictionary fetch failed: ", conditionMessage(e))
+  archive_area_river_dictionary(bundle$warmup$area_river_body),
+  error = function(e) log_msg("WARNING area-river dictionary archive failed: ", conditionMessage(e))
 )
 
 log_msg(
