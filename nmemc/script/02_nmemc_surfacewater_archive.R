@@ -136,6 +136,19 @@ SNAPSHOT_RETRY_SECONDS <- SNAPSHOT_RETRY_SECONDS[
   is.finite(SNAPSHOT_RETRY_SECONDS) & SNAPSHOT_RETRY_SECONDS >= 0
 ]
 
+# The cumulative RDS is the canonical processed history and is updated on every
+# successful collection. The compressed CSV is a convenience export; rewriting
+# ~1 million rows every 20 minutes is expensive and adds no source provenance.
+# By default refresh that CSV at most once per day. Set this option to 0 to
+# restore the previous always-write behavior, or Inf to disable automatic CSV
+# refreshes after the file has been created once.
+MASTER_CSV_REFRESH_HOURS <- suppressWarnings(as.numeric(
+  getOption("nmemc.surfacewater.master_csv_refresh_hours", 24)
+))
+if (is.na(MASTER_CSV_REFRESH_HOURS) || MASTER_CSV_REFRESH_HOURS < 0) {
+  MASTER_CSV_REFRESH_HOURS <- 24
+}
+
 log_file <- file.path(
   LOG_DIR,
   sprintf(
@@ -1133,7 +1146,60 @@ write_current_outputs <- function(parsed) {
   log_msg("Header dictionary: ", header_dictionary_path)
 }
 
+master_needs_hash_migration <- function(master) {
+  required <- c(
+    "observation_datetime", "observation_year_inferred",
+    "observation_key_hash", "row_hash"
+  )
+
+  if (!all(required %in% names(master))) return(TRUE)
+  if (any(is.na(master$observation_key_hash) | !nzchar(as.character(master$observation_key_hash)))) return(TRUE)
+  if (any(is.na(master$row_hash) | !nzchar(as.character(master$row_hash)))) return(TRUE)
+  FALSE
+}
+
+master_csv_is_due <- function(path, refresh_hours) {
+  if (!file.exists(path)) return(TRUE)
+  if (is.infinite(refresh_hours)) return(FALSE)
+  if (refresh_hours <= 0) return(TRUE)
+
+  info <- file.info(path)
+  if (is.na(info$mtime)) return(TRUE)
+  age_hours <- as.numeric(difftime(Sys.time(), info$mtime, units = "hours"))
+  is.na(age_hours) || age_hours >= refresh_hours
+}
+
+set_revision_counts <- function(master, affected_keys = NULL, force_full = FALSE) {
+  has_revision_count <- "revision_count" %in% names(master)
+
+  if (force_full || !has_revision_count) {
+    counts <- table(master$observation_key_hash, useNA = "no")
+    master$revision_count <- as.integer(
+      counts[match(master$observation_key_hash, names(counts))]
+    )
+    return(master)
+  }
+
+  master$revision_count <- as.integer(master$revision_count)
+
+  if (is.null(affected_keys) || length(affected_keys) == 0L) {
+    return(master)
+  }
+
+  affected_keys <- unique(as.character(affected_keys))
+  affected <- master$observation_key_hash %in% affected_keys
+  if (!any(affected)) return(master)
+
+  counts <- table(master$observation_key_hash[affected], useNA = "no")
+  master$revision_count[affected] <- as.integer(
+    counts[match(master$observation_key_hash[affected], names(counts))]
+  )
+  master
+}
+
 update_cumulative_master <- function(snapshot_data, run_time, source_cols) {
+  update_started <- Sys.time()
+
   # Count exact duplicate source rows within this snapshot rather than silently
   # discarding the information that duplicates occurred.
   snap_counts <- snapshot_data |>
@@ -1148,19 +1214,42 @@ update_cumulative_master <- function(snapshot_data, run_time, source_cols) {
       times_seen = as.integer(.data$snapshot_occurrences)
     )
 
+  full_revision_rebuild <- FALSE
+  affected_revision_keys <- character()
+  new_row_versions_n <- nrow(snap_unique)
+
   if (!file.exists(master_rds_path)) {
     master <- snap_unique
+    full_revision_rebuild <- TRUE
+    log_msg("Initializing cumulative CNEMC master from first processed snapshot")
   } else {
+    read_started <- Sys.time()
     master <- readRDS(master_rds_path)
+    log_msg(
+      "Loaded cumulative CNEMC master: ", nrow(master), " rows in ",
+      sprintf("%.2f", as.numeric(difftime(Sys.time(), read_started, units = "secs"))),
+      " second(s)"
+    )
 
-    # Schema migration for archives created by v1: recompute hashes using the
-    # inferred full observation timestamp. This prevents cross-year collisions
-    # and avoids duplicating existing rows when upgrading the script.
-    master <- recompute_observation_hashes(master, source_cols)
+    # The v1 -> v2 hash migration is expensive (~2 hashes x every historical
+    # row), so perform it only when the archive actually lacks the v2 schema.
+    # Previous versions recomputed these hashes on every 20-minute run.
+    if (master_needs_hash_migration(master)) {
+      migration_started <- Sys.time()
+      log_msg("Migrating legacy cumulative hash schema once ...")
+      master <- recompute_observation_hashes(master, source_cols)
+      full_revision_rebuild <- TRUE
+      log_msg(
+        "Legacy hash migration complete in ",
+        sprintf("%.2f", as.numeric(difftime(Sys.time(), migration_started, units = "secs"))),
+        " second(s)"
+      )
+    }
 
     matched <- match(snap_unique$row_hash, master$row_hash)
     existing_idx <- which(!is.na(matched))
     new_idx <- which(is.na(matched))
+    new_row_versions_n <- length(new_idx)
 
     if (length(existing_idx) > 0L) {
       mi <- matched[existing_idx]
@@ -1170,32 +1259,63 @@ update_cumulative_master <- function(snapshot_data, run_time, source_cols) {
     }
 
     if (length(new_idx) > 0L) {
-      master <- dplyr::bind_rows(master, snap_unique[new_idx, , drop = FALSE])
+      new_rows <- snap_unique[new_idx, , drop = FALSE]
+      affected_revision_keys <- unique(new_rows$observation_key_hash)
+      master <- dplyr::bind_rows(master, new_rows)
     }
   }
 
-  # Count distinct published versions for each station/time observation key.
-  revision_summary <- master |>
-    dplyr::count(.data$observation_key_hash, name = "revision_count")
+  # revision_count changes only when a new published row version is introduced.
+  # Recount the full ~million-row archive only for first initialization/schema
+  # migration; otherwise update just the observation keys touched by new rows.
+  master <- set_revision_counts(
+    master,
+    affected_keys = affected_revision_keys,
+    force_full = full_revision_rebuild
+  )
 
-  master <- master |>
-    dplyr::select(-dplyr::any_of("revision_count")) |>
-    dplyr::left_join(revision_summary, by = "observation_key_hash") |>
-    dplyr::arrange(.data$first_seen, .data$area, .data$monitoring_section)
+  # Appended rows already preserve first-seen chronology, so a full-table sort
+  # on every run is unnecessary. Avoiding it saves another O(n log n) pass.
 
-  saveRDS(master, master_rds_path, compress = "xz")
-  readr::write_csv(master, master_csv_path, na = "")
+  rds_started <- Sys.time()
+  saveRDS(master, master_rds_path, compress = "gzip")
+  log_msg(
+    "Cumulative RDS updated with gzip compression in ",
+    sprintf("%.2f", as.numeric(difftime(Sys.time(), rds_started, units = "secs"))),
+    " second(s)"
+  )
 
-  duplicate_counts <- snapshot_data |> dplyr::count(.data$row_hash, name = "n")
-  duplicate_source_n <- sum(duplicate_counts$n - 1L)
+  if (master_csv_is_due(master_csv_path, MASTER_CSV_REFRESH_HOURS)) {
+    csv_started <- Sys.time()
+    readr::write_csv(master, master_csv_path, na = "")
+    log_msg(
+      "Cumulative CSV refreshed: ", master_csv_path, " in ",
+      sprintf("%.2f", as.numeric(difftime(Sys.time(), csv_started, units = "secs"))),
+      " second(s)"
+    )
+  } else {
+    log_msg(
+      "Cumulative CSV refresh skipped; interval=", MASTER_CSV_REFRESH_HOURS,
+      " hour(s). RDS remains current. Set option ",
+      "nmemc.surfacewater.master_csv_refresh_hours=0 to force every run."
+    )
+  }
+
+  duplicate_source_n <- sum(snap_counts$snapshot_occurrences - 1L)
   revised_keys_n <- sum(master$revision_count > 1L, na.rm = TRUE)
 
   log_msg(
     "Cumulative archive: ", nrow(master), " unique published row version(s); ",
+    "new row versions this run: ", new_row_versions_n, "; ",
     "exact duplicate rows in current snapshot: ", duplicate_source_n
   )
   log_msg("Rows belonging to revised observation keys: ", revised_keys_n)
   log_msg("Cumulative RDS: ", master_rds_path)
+  log_msg(
+    "Cumulative archive update time: ",
+    sprintf("%.2f", as.numeric(difftime(Sys.time(), update_started, units = "secs"))),
+    " second(s)"
+  )
 
   invisible(master)
 }
