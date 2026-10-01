@@ -1,0 +1,93 @@
+PATCH FOR YOUR EXISTING 12_ DATASET BUILDER
+===========================================
+
+Do NOT replace the whole script 12 without inspecting it. Add these small blocks.
+
+1) CONFIGURATION: add these paths near your existing PROJECT_DIR / RECON_DIR paths
+---------------------------------------------------------------------------------
+
+CNEMC_ANALYSIS_HELPER <- file.path(
+  RECON_DIR,
+  "script",
+  "cnemc_analysis_helpers.R"
+)
+
+CNEMC_OBSERVATIONS <- file.path(
+  PROJECT_DIR,
+  "nmemc",
+  "data",
+  "surfacewater",
+  "processed",
+  "nmemc_surfacewater_observations.rds"
+)
+
+QINGYUE_STATION_CATALOG <- file.path(
+  PROJECT_DIR,
+  "nmemc",
+  "data",
+  "surfacewater",
+  "qingyue",
+  "processed",
+  "qingyue_national_station_catalog_unfiltered.csv"
+)
+
+CNEMC_COORD_CROSSWALK <- file.path(
+  PROJECT_DIR,
+  "nmemc",
+  "data",
+  "surfacewater",
+  "processed",
+  "cnemc_station_crosswalk.csv"
+)
+
+CNEMC_STATION_OVERRIDES <- file.path(
+  RECON_DIR,
+  "reference",
+  "cnemc_station_overrides.csv"
+)
+
+CNEMC_STATION_QA_DIR <- file.path(
+  PROJECT_DIR,
+  "nmemc",
+  "data",
+  "surfacewater",
+  "processed",
+  "station_reference_qa"
+)
+
+
+2) AFTER PACKAGE CHECKS: source helper and ensure the crosswalk is current
+-------------------------------------------------------------------------
+
+if (!file.exists(CNEMC_ANALYSIS_HELPER)) {
+  stop(
+    "Missing CNEMC analysis helper: ",
+    CNEMC_ANALYSIS_HELPER,
+    call. = FALSE
+  )
+}
+
+source(CNEMC_ANALYSIS_HELPER, encoding = "UTF-8")
+
+ensure_cnemc_station_crosswalk(
+  cnemc_observations_path = CNEMC_OBSERVATIONS,
+  qingyue_catalog_path = QINGYUE_STATION_CATALOG,
+  output_path = CNEMC_COORD_CROSSWALK,
+  overrides_path = CNEMC_STATION_OVERRIDES,
+  qa_dir = CNEMC_STATION_QA_DIR,
+  force = FALSE,
+  quiet = FALSE
+)
+
+
+3) INSIDE build_cnemc(): immediately after `latest <- ...` has been built,
+   and BEFORE your existing `assert_unique(...)`, add:
+-------------------------------------------------------------------------
+
+latest <- attach_cnemc_station_reference(
+  latest,
+  crosswalk_path = CNEMC_COORD_CROSSWALK
+)
+
+
+That is all script 12 needs. Leave scripts 01-04 unchanged.
