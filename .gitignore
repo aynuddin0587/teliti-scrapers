@@ -40,6 +40,8 @@
 
 /nmemc/script/*
 
+!/nmemc/script/qingyue/
+
 !/nmemc/script/01_nmemc_water_archive.R
 !/nmemc/script/02_nmemc_surfacewater_archive.R
 
