@@ -98,6 +98,55 @@ RECON_EVIDENCE <- c(
   )
 )
 
+CNEMC_ANALYSIS_HELPER <- file.path(
+  RECON_DIR,
+  "script",
+  "cnemc_analysis_helpers.R"
+)
+
+CNEMC_OBSERVATIONS <- file.path(
+  PROJECT_DIR,
+  "nmemc",
+  "data",
+  "surfacewater",
+  "processed",
+  "nmemc_surfacewater_observations.rds"
+)
+
+QINGYUE_STATION_CATALOG <- file.path(
+  PROJECT_DIR,
+  "nmemc",
+  "data",
+  "surfacewater",
+  "qingyue",
+  "processed",
+  "qingyue_national_station_catalog_unfiltered.csv"
+)
+
+CNEMC_COORD_CROSSWALK <- file.path(
+  PROJECT_DIR,
+  "nmemc",
+  "data",
+  "surfacewater",
+  "processed",
+  "cnemc_station_crosswalk.csv"
+)
+
+CNEMC_STATION_OVERRIDES <- file.path(
+  RECON_DIR,
+  "reference",
+  "cnemc_station_overrides.csv"
+)
+
+CNEMC_STATION_QA_DIR <- file.path(
+  PROJECT_DIR,
+  "nmemc",
+  "data",
+  "surfacewater",
+  "processed",
+  "station_reference_qa"
+)
+
 # ----------------------------------------------------------------------------
 # 2. Packages
 # ----------------------------------------------------------------------------
@@ -122,6 +171,26 @@ suppressPackageStartupMessages({
 })
 
 dir.create(ANALYSIS_DIR, recursive = TRUE, showWarnings = FALSE)
+
+if (!file.exists(CNEMC_ANALYSIS_HELPER)) {
+  stop(
+    "Missing CNEMC analysis helper: ",
+    CNEMC_ANALYSIS_HELPER,
+    call. = FALSE
+  )
+}
+
+source(CNEMC_ANALYSIS_HELPER, encoding = "UTF-8")
+
+ensure_cnemc_station_crosswalk(
+  cnemc_observations_path = CNEMC_OBSERVATIONS,
+  qingyue_catalog_path = QINGYUE_STATION_CATALOG,
+  output_path = CNEMC_COORD_CROSSWALK,
+  overrides_path = CNEMC_STATION_OVERRIDES,
+  qa_dir = CNEMC_STATION_QA_DIR,
+  force = FALSE,
+  quiet = FALSE
+)
 
 # ----------------------------------------------------------------------------
 # 3. General helpers
@@ -1312,10 +1381,13 @@ build_cnemc <- function() {
   # --------------------------------------------------------------------------
   enrichment_started <- Sys.time()
   latest <- clean_cnemc_analysis_fields(latest)
-  latest <- attach_cnemc_station_coordinates(
+  # latest <- attach_cnemc_station_coordinates(
+  #   latest,
+  #   CNEMC_COORD_CROSSWALK
+  # )
+  latest <- attach_cnemc_station_reference(
     latest,
-    CNEMC_COORD_CROSSWALK
-  )
+    crosswalk_path = CNEMC_COORD_CROSSWALK)
   msg(
     "CNEMC analytical enrichment time: ",
     sprintf(
@@ -1477,60 +1549,32 @@ build_onlimo_historical <- function() {
 # 11. Unified station metadata
 # ----------------------------------------------------------------------------
 build_cnemc_station_metadata_fast <- function(cnemc_latest) {
-  current_station_n <- if ("analysis_station_key" %in% names(cnemc_latest)) {
-    n_distinct(cnemc_latest$analysis_station_key[!is.na(cnemc_latest$analysis_station_key)])
-  } else {
-    NA_integer_
-  }
+  # Qingyue station metadata has already been attached to cnemc_latest by
+  # attach_cnemc_station_reference() inside build_cnemc(). Therefore the
+  # current latest view is the authoritative source for unified CNEMC station
+  # metadata. Do not prefer the legacy cnemc_station_coordinate_coverage.csv
+  # cache: it can have the correct number of station rows while still carrying
+  # older/incomplete coordinates.
 
-  # Preferred source when it is demonstrably current: script 15 already reduced
-  # CNEMC to one row per canonical station and attached audited coordinates.
-  if (file.exists(CNEMC_COORD_COVERAGE)) {
-    x <- safe_read_csv(CNEMC_COORD_COVERAGE)
-    required <- c("station_key", "area_cn", "monitoring_section_cn")
-    coverage_is_current <- !is.null(x) && nrow(x) > 0L &&
-      all(required %in% names(x)) &&
-      (is.na(current_station_n) || nrow(x) == current_station_n)
-
-    if (coverage_is_current) {
-      lon <- if ("longitude" %in% names(x)) suppressWarnings(as.numeric(x$longitude)) else rep(NA_real_, nrow(x))
-      lat <- if ("latitude" %in% names(x)) suppressWarnings(as.numeric(x$latitude)) else rep(NA_real_, nrow(x))
-      msg("CNEMC station metadata source: coordinate coverage cache (", nrow(x), " stations)")
-      return(tibble(
-        network = "CNEMC surface water",
-        station_id = NA_character_,
-        station_name = as.character(x$monitoring_section_cn),
-        station_name_en = NA_character_,
-        waterbody = if ("river_basin_cn" %in% names(x)) as.character(x$river_basin_cn) else NA_character_,
-        admin1 = as.character(x$area_cn),
-        admin2 = if ("city_cn" %in% names(x)) as.character(x$city_cn) else NA_character_,
-        longitude = lon,
-        latitude = lat,
-        coordinate_source = if ("coordinate_source" %in% names(x)) as.character(x$coordinate_source) else ifelse(valid_lonlat(lon, lat), "cnemc_station_crosswalk", NA_character_),
-        station_key = as.character(x$station_key)
-      ) %>%
-        arrange(station_key) %>%
-        distinct(network, station_key, .keep_all = TRUE))
-    }
-
-    if (!is.null(x) && nrow(x) > 0L && !is.na(current_station_n) && nrow(x) != current_station_n) {
-      msg(
-        "CNEMC coordinate coverage cache is stale (", nrow(x),
-        " vs current ", current_station_n, " stations); rebuilding station metadata from current latest view."
-      )
-    }
-  }
-
-  # Fresh compact extraction from the current latest view. This scans only the
-  # handful of station-level columns and collapses immediately to distinct keys;
-  # it does not re-clean parameters or reconstruct the full observation table.
-  cn_name <- find_col(cnemc_latest, c("monitoring_section_cn", "monitoring_section", "station_name", "section_name"))
+  cn_name <- find_col(
+    cnemc_latest,
+    c("monitoring_section_cn", "monitoring_section", "station_name", "section_name")
+  )
   cn_area <- find_col(cnemc_latest, c("area_cn", "area", "province"))
-  cn_river <- find_col(cnemc_latest, c("river_basin_cn", "river_basin", "river"))
-  cn_city <- find_col(cnemc_latest, c("station_city", "city"))
+  cn_river <- find_col(
+    cnemc_latest,
+    c("river_basin_cn", "river_basin", "river", "reference_valley")
+  )
+  cn_city <- find_col(
+    cnemc_latest,
+    c("reference_city", "station_city", "city")
+  )
   cn_lon <- find_coord_col_flexible(cnemc_latest, "lon")
   cn_lat <- find_coord_col_flexible(cnemc_latest, "lat")
-  cn_coordinate_source <- find_col(cnemc_latest, c("station_coordinate_source", "coordinate_source"))
+  cn_coordinate_source <- find_col(
+    cnemc_latest,
+    c("coordinate_source", "station_coordinate_source")
+  )
   cn_key <- find_col(cnemc_latest, c("analysis_station_key", "station_key"))
 
   if (!is.na(cn_name) && !is.na(cn_area)) {
@@ -1549,60 +1593,134 @@ build_cnemc_station_metadata_fast <- function(cnemc_latest) {
       station_id = NA_character_,
       station_name = as.character(cnemc_latest[[cn_name]]),
       station_name_en = NA_character_,
-      waterbody = if (!is.na(cn_river)) as.character(cnemc_latest[[cn_river]]) else NA_character_,
+      waterbody = if (!is.na(cn_river)) {
+        as.character(cnemc_latest[[cn_river]])
+      } else {
+        NA_character_
+      },
       admin1 = as.character(cnemc_latest[[cn_area]]),
-      admin2 = if (!is.na(cn_city)) as.character(cnemc_latest[[cn_city]]) else NA_character_,
-      longitude = if (!is.na(cn_lon)) suppressWarnings(as.numeric(cnemc_latest[[cn_lon]])) else NA_real_,
-      latitude = if (!is.na(cn_lat)) suppressWarnings(as.numeric(cnemc_latest[[cn_lat]])) else NA_real_,
-      coordinate_source = if (!is.na(cn_coordinate_source)) as.character(cnemc_latest[[cn_coordinate_source]]) else NA_character_,
+      admin2 = if (!is.na(cn_city)) {
+        as.character(cnemc_latest[[cn_city]])
+      } else {
+        NA_character_
+      },
+      longitude = if (!is.na(cn_lon)) {
+        suppressWarnings(as.numeric(cnemc_latest[[cn_lon]]))
+      } else {
+        NA_real_
+      },
+      latitude = if (!is.na(cn_lat)) {
+        suppressWarnings(as.numeric(cnemc_latest[[cn_lat]]))
+      } else {
+        NA_real_
+      },
+      coordinate_source = if (!is.na(cn_coordinate_source)) {
+        as.character(cnemc_latest[[cn_coordinate_source]])
+      } else {
+        NA_character_
+      },
       station_key = station_key
     ) %>%
       filter(!is.na(station_key), nzchar(station_key)) %>%
       arrange(station_key, desc(valid_lonlat(longitude, latitude))) %>%
       distinct(network, station_key, .keep_all = TRUE)
 
-    msg("CNEMC station metadata source: current latest view compact extraction (", nrow(out), " stations)")
+    # Cross-check against the freshly generated Qingyue-backed station
+    # crosswalk. A mismatch is a build error because both objects should now
+    # describe the same 1-row-per-CNEMC-station reference layer.
+    if (file.exists(CNEMC_COORD_CROSSWALK)) {
+      cw <- safe_read_csv(CNEMC_COORD_CROSSWALK)
+      if (
+        !is.null(cw) &&
+        nrow(cw) > 0L &&
+        all(c("cnemc_station_name", "cnemc_area", "longitude", "latitude") %in% names(cw))
+      ) {
+        expected_n <- nrow(cw)
+        expected_coord_n <- sum(
+          valid_lonlat(
+            suppressWarnings(as.numeric(cw$longitude)),
+            suppressWarnings(as.numeric(cw$latitude))
+          ),
+          na.rm = TRUE
+        )
+        actual_coord_n <- sum(
+          valid_lonlat(out$longitude, out$latitude),
+          na.rm = TRUE
+        )
+
+        if (nrow(out) != expected_n) {
+          stop(
+            "CNEMC station metadata row count (", nrow(out),
+            ") does not match current station crosswalk (", expected_n, ").",
+            call. = FALSE
+          )
+        }
+
+        if (actual_coord_n != expected_coord_n) {
+          stop(
+            "CNEMC station coordinate coverage in current latest view (",
+            actual_coord_n, ") does not match current Qingyue-backed crosswalk (",
+            expected_coord_n, "). Refusing to use stale station metadata.",
+            call. = FALSE
+          )
+        }
+      }
+    }
+
+    msg(
+      "CNEMC station metadata source: current latest view + Qingyue reference (",
+      nrow(out), " stations; coordinates=",
+      sum(valid_lonlat(out$longitude, out$latitude), na.rm = TRUE), ")"
+    )
     return(out)
   }
 
-  # Last fallback: cached catalogue + coordinate crosswalk.
-  if (file.exists(CNEMC_STATION_CATALOGUE)) {
-    x <- safe_read_csv(CNEMC_STATION_CATALOGUE)
-    if (!is.null(x) && nrow(x) > 0L && all(c("station_key", "area_cn", "monitoring_section_cn") %in% names(x))) {
-      cw <- safe_read_csv(CNEMC_COORD_CROSSWALK)
-      if (is.null(cw)) cw <- tibble()
-      if (nrow(cw) > 0L && "station_key" %in% names(cw)) {
-        cw <- cw %>%
-          transmute(
-            station_key = as.character(station_key),
-            longitude = suppressWarnings(as.numeric(longitude)),
-            latitude = suppressWarnings(as.numeric(latitude)),
-            cw_city = if ("city_cn" %in% names(cw)) as.character(city_cn) else NA_character_,
-            coordinate_source = if ("coordinate_source" %in% names(cw)) as.character(coordinate_source) else "cnemc_station_crosswalk"
-          )
-        x <- x %>% left_join(cw, by = "station_key")
+  # Fallback only if the current latest view does not expose station identity
+  # fields. Use the NEW Qingyue-backed crosswalk directly, not the legacy
+  # coordinate-coverage cache or the older station-catalogue schema.
+  if (file.exists(CNEMC_COORD_CROSSWALK)) {
+    cw <- safe_read_csv(CNEMC_COORD_CROSSWALK)
+    required <- c(
+      "cnemc_station_name", "cnemc_area", "cnemc_river_basin",
+      "longitude", "latitude", "coordinate_source"
+    )
+
+    if (!is.null(cw) && nrow(cw) > 0L && all(required %in% names(cw))) {
+      city <- if ("reference_city" %in% names(cw)) {
+        as.character(cw$reference_city)
       } else {
-        x$longitude <- NA_real_
-        x$latitude <- NA_real_
-        x$cw_city <- NA_character_
-        x$coordinate_source <- NA_character_
+        rep(NA_character_, nrow(cw))
       }
-      msg("CNEMC station metadata source: cached station catalogue (", nrow(x), " stations)")
-      return(tibble(
+
+      station_key <- paste(
+        normalize_station_key(cw$cnemc_area),
+        normalize_station_key(cw$cnemc_station_name),
+        sep = "|"
+      )
+
+      out <- tibble(
         network = "CNEMC surface water",
         station_id = NA_character_,
-        station_name = as.character(x$monitoring_section_cn),
+        station_name = as.character(cw$cnemc_station_name),
         station_name_en = NA_character_,
-        waterbody = if ("river_basin_cn" %in% names(x)) as.character(x$river_basin_cn) else NA_character_,
-        admin1 = as.character(x$area_cn),
-        admin2 = if ("city_cn" %in% names(x)) dplyr::coalesce(as.character(x$cw_city), as.character(x$city_cn)) else as.character(x$cw_city),
-        longitude = suppressWarnings(as.numeric(x$longitude)),
-        latitude = suppressWarnings(as.numeric(x$latitude)),
-        coordinate_source = as.character(x$coordinate_source),
-        station_key = as.character(x$station_key)
+        waterbody = as.character(cw$cnemc_river_basin),
+        admin1 = as.character(cw$cnemc_area),
+        admin2 = city,
+        longitude = suppressWarnings(as.numeric(cw$longitude)),
+        latitude = suppressWarnings(as.numeric(cw$latitude)),
+        coordinate_source = as.character(cw$coordinate_source),
+        station_key = station_key
       ) %>%
-        arrange(station_key) %>%
-        distinct(network, station_key, .keep_all = TRUE))
+        filter(!is.na(station_key), nzchar(station_key)) %>%
+        arrange(station_key, desc(valid_lonlat(longitude, latitude))) %>%
+        distinct(network, station_key, .keep_all = TRUE)
+
+      msg(
+        "CNEMC station metadata source: Qingyue-backed station crosswalk fallback (",
+        nrow(out), " stations; coordinates=",
+        sum(valid_lonlat(out$longitude, out$latitude), na.rm = TRUE), ")"
+      )
+      return(out)
     }
   }
 
