@@ -1,3 +1,10 @@
+# ============================================================================
+# CNEMC surface-water archive: teliti-scrapers -> private teliti-data-backup
+# ============================================================================
+# Preserves the existing SSH deploy-key checkout and retry-safe backup push.
+# A failed source request is recorded in the private backup before the job
+# is marked failed. No stale water-quality snapshot is treated as new data.
+
 name: CNEMC Surface Water Backup
 
 on:
@@ -18,12 +25,16 @@ jobs:
   backup-cnemc:
     runs-on: ubuntu-24.04
     timeout-minutes: 18
+
     env:
       TZ: Asia/Taipei
       TELITI_TIMEZONE: Asia/Taipei
       TELITI_COLLECTOR_ID: github_actions
       TELITI_DATA_ROOT: ${{ github.workspace }}/run-data
       TELITI_BACKUP_REPO: ${{ github.workspace }}/teliti-data-backup
+      # Match the input directory required by prepare_cnemc_backup.R.
+      # This overrides the replacement scraper's different GitHub default.
+      CNEMC_SURFACE_DIR: ${{ github.workspace }}/run-data/nmemc/data/surfacewater
 
     steps:
       - name: Check out scraper repository
@@ -57,21 +68,86 @@ jobs:
         uses: r-lib/actions/setup-renv@v2
         timeout-minutes: 8
 
+      # Diagnostic only: a server outage does not skip the scraper.
+      - name: Diagnose CNEMC connectivity
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          echo "DNS resolution:"
+          getent ahostsv4 szzdjc.cnemc.cn || true
+
+          echo "Testing CNEMC website on TCP port 8070:"
+          curl -v \
+            --connect-timeout 10 \
+            --max-time 20 \
+            -o /dev/null \
+            -w '\nHTTP=%{http_code}; TCP_connect=%{time_connect}s\n' \
+            'https://szzdjc.cnemc.cn:8070/GJZ/Business/Publish/Main.html' \
+            || echo '::warning::CNEMC source is currently unreachable'
+
       - name: Run CNEMC surface-water scraper
+        id: scraper
+        # Allows the next step to preserve failure metadata. The final check
+        # below explicitly restores a failed workflow outcome.
+        continue-on-error: true
         timeout-minutes: 10
+        shell: bash
         run: |
           echo "CNEMC scraper started:"
           date --iso-8601=seconds
+          echo "CNEMC output directory: ${CNEMC_SURFACE_DIR}"
 
           Rscript nmemc/script/02_nmemc_surfacewater_archive.R
 
           echo "CNEMC scraper finished:"
           date --iso-8601=seconds
 
+      # The existing backup preparation requires a valid COMPLETE snapshot.
+      # It must never run with no current snapshot during a server outage.
       - name: Prepare persistent CNEMC backup
+        if: ${{ steps.scraper.outcome == 'success' }}
         timeout-minutes: 5
         run: |
           Rscript .github/scripts/prepare_cnemc_backup.R
+
+      # Store actual collection failures in a separate private-repo manifest.
+      # This does not modify the existing successful collection_manifest.csv.
+      - name: Preserve failed CNEMC attempts in private backup
+        if: ${{ steps.scraper.outcome == 'failure' }}
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          src="${CNEMC_SURFACE_DIR}/manifests/attempt_manifest.csv"
+          dest_dir="${TELITI_BACKUP_REPO}/cnemc_surfacewater/diagnostics"
+          mkdir -p "${dest_dir}"
+          month="$(TZ=Asia/Taipei date '+%Y%m')"
+          dest="${dest_dir}/failed_attempts_${month}.csv"
+
+          if [[ -s "${src}" ]]; then
+            if [[ -f "${dest}" ]]; then
+              if [[ "$(head -n 1 "${src}")" != "$(head -n 1 "${dest}")" ]]; then
+                echo '::error::CNEMC attempt manifest format changed; refusing to corrupt existing CSV'
+                exit 1
+              fi
+              tail -n +2 "${src}" >> "${dest}"
+            else
+              cp "${src}" "${dest}"
+            fi
+            echo "Recorded CNEMC failure attempts in ${dest}"
+          else
+            # A failure before the scraper initialized still receives a record.
+            if [[ ! -f "${dest}" ]]; then
+              printf '%s\n' 'collection_key,github_run_id,github_run_attempt,recorded_at,attempt,status,error_class,error_message,snapshot_md5,rows' > "${dest}"
+            fi
+            printf '%s,%s,%s,%s,0,failed,unclassified_error,No attempt manifest generated,,\n' \
+              "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+              "${GITHUB_RUN_ID}" \
+              "${GITHUB_RUN_ATTEMPT}" \
+              "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "${dest}"
+            echo "Recorded early scraper failure in ${dest}"
+          fi
 
       - name: Show backup repository changes
         timeout-minutes: 2
@@ -95,14 +171,24 @@ jobs:
           git status
           git log --oneline -5
 
+      # Do not label a failed collection as a successful scheduled observation.
+      # This runs only after the attempted private-repository push above.
+      - name: Report failed CNEMC collection
+        if: ${{ steps.scraper.outcome == 'failure' }}
+        run: |
+          echo '::error::CNEMC collection failed. Failure attempts were preserved in teliti-data-backup.'
+          exit 1
+
       - name: Upload diagnostics if workflow fails or is cancelled
         if: ${{ failure() || cancelled() }}
         timeout-minutes: 3
         uses: actions/upload-artifact@v7
         with:
-          name: cnemc-backup-failure-${{ github.run_id }}
+          name: cnemc-backup-failure-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             run-data/nmemc/log/
+            run-data/nmemc/data/surfacewater/log/
+            run-data/nmemc/data/surfacewater/manifests/attempt_manifest.csv
             run-data/nmemc/data/surfacewater/source/surfacewater_current_meta.rds
           if-no-files-found: warn
           retention-days: 7
