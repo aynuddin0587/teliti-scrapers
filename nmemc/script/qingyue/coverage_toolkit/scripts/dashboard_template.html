@@ -1,0 +1,32 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Qingyue | Coverage observatory</title>
+<style>
+:root{--ink:#18344d;--soft:#5b7081;--line:#e1e9ed;--tint:#eef4f5;--accent:#147989}
+*{box-sizing:border-box}body{margin:0;background:#f6f9fa;color:var(--ink);font:15px/1.55 system-ui,'Segoe UI',Arial,sans-serif}
+header{background:linear-gradient(118deg,#113750,#1b6d7b);color:white;padding:42px max(24px,calc((100vw - 1200px)/2))}
+header h1{font-size:clamp(26px,3vw,36px);margin:0 0 4px}header p{max-width:850px;margin:4px 0;opacity:.89}
+main{max-width:1240px;padding:28px 20px 80px;margin:auto}h2{margin-top:30px;font-size:21px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+.kpi{background:white;border:1px solid var(--line);border-radius:10px;padding:16px}
+.kpi small{display:block;color:var(--soft)}.kpi strong{display:block;font-size:26px;letter-spacing:-.4px}
+.vizgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,490px),1fr));gap:16px}
+.viz{background:white;border:1px solid var(--line);border-radius:10px;overflow:hidden;padding:15px}
+.viz img{width:100%;object-fit:contain}.viz h3{font-size:15px;margin:0 0 10px}
+.viz p{margin:6px 0 0;color:var(--soft);font-size:13px}
+a{color:var(--accent)}table{border-collapse:collapse;width:100%;background:white}
+th,td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:right;font-variant-numeric:tabular-nums}
+th:first-child,td:first-child{text-align:left}th{color:var(--soft);background:var(--tint);font-size:12px}
+.panel{background:white;border:1px solid var(--line);border-radius:10px;padding:20px;margin:18px 0}
+.notice{border-left:4px solid #d69b3a;background:#fff9ec;padding:14px 16px;border-radius:5px}
+.filelinks{columns:2;list-style-type:none;padding:0}.filelinks li{margin:8px 0}
+</style></head><body>
+<header><h1>Qingyue · Coverage observatory</h1><p>Water-quality archive | Acquisition, spatial–temporal continuity, and parameter availability</p>
+<p>Generated in UTC: {{GENERATED}}. Refreshed from local CSV exports; no API calls or SQLite edits.</p></header>
+<main><div class="notice"><b>Interpretation:</b> a completed request is not necessarily a retrieved or scientifically usable observation. Monthly noon records are point snapshots, not monthly averages. The 2026 source may omit monitoring-status fields; compare strict and numeric coverage charts.</div>
+<h2>Acquisition and measurement indicators</h2><div class="kpis">{{METRICS}}</div>
+<h2>Stage completion</h2><div class="panel" style="overflow:auto"><table><thead><tr>{{HEADERS}}</tr></thead><tbody>{{STAGES}}</tbody></table></div>
+<h2>Coverage figures</h2><div class="vizgrid">{{FIGCARDS}}</div>
+<h2>Reproducible datasets</h2><div class="panel"><ul class="filelinks">{{FILELINKS}}</ul>
+<p>Rerun the coverage compiler with the latest exports to update all figures. The refresh history saves each distinct acquisition-state snapshot.</p></div>
+<p style="font-size:12px;color:var(--soft)">Study-site codes and point-in-polygon overlap are descriptive; they do not independently establish watershed connectivity or measurement calibration.</p>
+</main></body></html>
