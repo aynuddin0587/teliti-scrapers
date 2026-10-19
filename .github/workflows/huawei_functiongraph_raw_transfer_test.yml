@@ -1,0 +1,211 @@
+name: Huawei FunctionGraph CNEMC raw transfer test
+
+# Manual-only integration test: no schedule, commits, backup writes, or artifacts.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: huawei-cnemc-raw-transfer-test
+  cancel-in-progress: false
+
+jobs:
+  raw-transfer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install official Huawei FunctionGraph SDK
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check huaweicloudsdkfunctiongraph
+
+      - name: Invoke Huawei, transfer raw pages, and validate source bytes
+        shell: bash
+        env:
+          HUAWEI_REGION: cn-east-3
+          HUAWEI_AK: ${{ secrets.HUAWEI_FUNCTIONGRAPH_AK }}
+          HUAWEI_SK: ${{ secrets.HUAWEI_FUNCTIONGRAPH_SK }}
+          HUAWEI_PROJECT_ID: ${{ vars.HUAWEI_PROJECT_ID }}
+          HUAWEI_FUNCTION_URN: ${{ vars.HUAWEI_FUNCTION_URN }}
+        run: |
+          python - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
+          import tempfile
+          import zlib
+
+          from huaweicloudsdkcore.auth.credentials import BasicCredentials
+          from huaweicloudsdkcore.exceptions import exceptions
+          from huaweicloudsdkfunctiongraph.v2 import FunctionGraphClient, InvokeFunctionRequest
+          from huaweicloudsdkfunctiongraph.v2.region.functiongraph_region import FunctionGraphRegion
+
+          MAX_PAGE_BYTES = 20 * 1024 * 1024
+          REGION = 'cn-east-3'
+
+          ak = os.environ.get('HUAWEI_AK', '')
+          sk = os.environ.get('HUAWEI_SK', '')
+          project = os.environ.get('HUAWEI_PROJECT_ID', '')
+          urn = os.environ.get('HUAWEI_FUNCTION_URN', '')
+          if not all((ak, sk, project, urn)):
+              sys.exit('Missing Huawei Actions secrets or repository variables.')
+          if len(project) != 32 or not project.isalnum():
+              sys.exit('HUAWEI_PROJECT_ID must be a 32-character ID.')
+          if not urn.startswith(f'urn:fss:{REGION}:{project}:'):
+              sys.exit('Function URN does not match cn-east-3 and project ID.')
+
+          client = (FunctionGraphClient.new_builder()
+                    .with_credentials(BasicCredentials(ak, sk, project))
+                    .with_region(FunctionGraphRegion.value_of(REGION))
+                    .build())
+          req = InvokeFunctionRequest()
+          req.function_urn = urn
+          req.body = {'purpose': 'export_raw_snapshot_v1'}
+          req.x_cff_request_version = 'v1'
+
+          try:
+              response = client.invoke_function(req)
+          except exceptions.ClientRequestException as err:
+              sys.exit(f'Huawei API error HTTP {err.status_code}: '
+                       f'{err.error_code} ({str(err.error_msg)[:180]})')
+          status = getattr(response, 'status', None)
+          if status is not None and str(status) != '200':
+              sys.exit(f'FunctionGraph returned invocation status {status}')
+
+          def unpack(value):
+              for _ in range(5):
+                  if isinstance(value, str):
+                      try:
+                          value = json.loads(value)
+                      except json.JSONDecodeError:
+                          return value
+                  elif isinstance(value, dict) and 'statusCode' in value and 'body' in value:
+                      value = value['body']
+                  elif isinstance(value, dict) and 'result' in value and 'ok' not in value:
+                      value = value['result']
+                  else:
+                      break
+              return value
+
+          obj = unpack(getattr(response, 'result', None))
+          if not isinstance(obj, dict):
+              sys.exit('FunctionGraph did not return a JSON object.')
+          if obj.get('ok') is not True:
+              sys.exit(f'CNEMC export returned ok=false: {str(obj.get("error"))[:200]}')
+          if obj.get('purpose') != 'export_raw_snapshot_v1':
+              sys.exit('FunctionGraph is still running the metadata-only version of index.py.')
+
+          transport = obj.get('transport')
+          if not isinstance(transport, dict) or transport.get('protocol') != 'cnemc-source-bytes-v1':
+              sys.exit('FunctionGraph did not return expected byte-preserving transport data.')
+          pages = transport.get('pages')
+          metadata = obj.get('pages')
+          n_pages = obj.get('total_pages')
+          if (not isinstance(n_pages, int) or n_pages < 1 or
+                  not isinstance(pages, list) or len(pages) != n_pages or
+                  not isinstance(metadata, list) or len(metadata) != n_pages):
+              sys.exit('Incomplete source page manifest.')
+
+          def unpack_raw(entry):
+              if entry.get('encoding') != 'zlib+base64':
+                  raise ValueError('Unexpected transport encoding')
+              compressed = base64.b64decode(entry['body_zlib_b64'], validate=True)
+              decoder = zlib.decompressobj()
+              body = decoder.decompress(compressed, MAX_PAGE_BYTES + 1)
+              if len(body) > MAX_PAGE_BYTES or decoder.unconsumed_tail:
+                  raise ValueError('Decompressed page exceeds safety limit')
+              body += decoder.flush()
+              if len(body) > MAX_PAGE_BYTES or not decoder.eof or decoder.unused_data:
+                  raise ValueError('Invalid or oversized compressed response')
+              if len(body) != entry.get('raw_bytes'):
+                  raise ValueError('Raw byte length mismatch')
+              if hashlib.md5(body).hexdigest() != entry.get('raw_md5'):
+                  raise ValueError('Raw MD5 mismatch')
+              if hashlib.sha256(body).hexdigest() != entry.get('raw_sha256'):
+                  raise ValueError('Raw SHA256 mismatch')
+              return body
+
+          page_md5 = []
+          total_rows = 0
+          total_bytes = 0
+          header_first = None
+          manifest = []
+          # Test transfer by writing and reading real raw files; delete
+          # everything when the job step ends. No Git history or artifacts.
+          with tempfile.TemporaryDirectory(prefix='cnemc_phase4_', dir=os.environ['RUNNER_TEMP']) as tmp:
+              location = pathlib.Path(tmp)
+              for i, (page, meta) in enumerate(zip(pages, metadata), start=1):
+                  if page.get('page_index') != i or meta.get('page_index') != i:
+                      raise ValueError('Page index mismatch')
+                  body = unpack_raw(page)
+                  path = location / f'page_{i:03d}_raw.json'
+                  path.write_bytes(body)
+                  if path.read_bytes() != body:
+                      raise ValueError('Round-trip raw file mismatch')
+                  doc = json.loads(body.decode('utf-8-sig'))
+                  if not isinstance(doc, dict) or str(doc.get('result')).lower() in ('0', 'false', 'none'):
+                      raise ValueError('Unsuccessful source API result')
+                  headers, rows = doc.get('thead'), doc.get('tbody')
+                  if not isinstance(headers, list) or not headers or not isinstance(rows, list):
+                      raise ValueError('Incomplete source data table')
+                  if header_first is None:
+                      header_first = headers
+                  if headers != header_first or int(doc.get('total', 1)) != n_pages:
+                      raise ValueError('Source page metadata inconsistent')
+                  if len(rows) != meta.get('row_count') or len(body) != meta.get('response_bytes'):
+                      raise ValueError('Source page row or byte count mismatch')
+                  digest = hashlib.md5(body).hexdigest()
+                  if digest != meta.get('source_body_md5'):
+                      raise ValueError('Page MD5 does not match Huawei metadata')
+                  page_md5.append(digest)
+                  total_rows += len(rows)
+                  total_bytes += len(body)
+                  manifest.append({'page_index': i, 'rows': len(rows),
+                                   'bytes': len(body), 'md5': digest})
+
+              source_dict = transport.get('area_river')
+              if source_dict is not None:
+                  raw_dictionary = unpack_raw(source_dict)
+                  (location / 'area_river_raw.bin').write_bytes(raw_dictionary)
+                  if hashlib.sha256(raw_dictionary).hexdigest() != obj['dictionary']['sha256']:
+                      raise ValueError('Dictionary SHA256 mismatch')
+
+              hash_snapshot = hashlib.md5('|'.join(page_md5).encode('utf-8')).hexdigest()
+              if hash_snapshot != obj.get('snapshot_md5_r_compatible'):
+                  raise ValueError('R-compatible snapshot MD5 mismatch')
+              if total_rows <= 0 or total_rows != obj.get('total_rows'):
+                  raise ValueError('Nationwide row count mismatch')
+              if len(header_first) != obj.get('header_columns'):
+                  raise ValueError('Source column count mismatch')
+
+              report = {
+                  'result': 'PASS: exact raw CNEMC response bytes reached GitHub',
+                  'region': REGION,
+                  'nationwide_rows': total_rows,
+                  'total_pages': n_pages,
+                  'raw_page_bytes': total_bytes,
+                  'snapshot_md5_r_compatible': hash_snapshot,
+                  'source_checked_at_utc': obj.get('checked_at_utc'),
+                  'function_seconds': obj.get('elapsed_seconds'),
+                  'archive_updated': False,
+                  'temporary_files_deleted_after_test': True,
+              }
+              print(json.dumps(report, indent=2))
+              summary_path = os.environ.get('GITHUB_STEP_SUMMARY')
+              if summary_path:
+                  with open(summary_path, 'a', encoding='utf-8') as out:
+                      out.write('## CNEMC source-byte transfer test\n\n')
+                      for k, v in report.items():
+                          out.write(f'- **{k}**: `{v}`\n')
+                      out.write('\nNo production or private-backup files were changed.\n')
+          PY
