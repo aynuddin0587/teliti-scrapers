@@ -1,0 +1,124 @@
+name: Huawei FunctionGraph authenticated CNEMC API test
+
+# Manual-only test: does not alter the CNEMC production workflow or backup.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  invoke-cnemc-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install official Huawei FunctionGraph SDK
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check huaweicloudsdkfunctiongraph
+
+      - name: Invoke Shanghai 1 FunctionGraph (read-only test)
+        shell: bash
+        env:
+          HUAWEI_REGION: cn-east-3
+          HUAWEI_AK: ${{ secrets.HUAWEI_FUNCTIONGRAPH_AK }}
+          HUAWEI_SK: ${{ secrets.HUAWEI_FUNCTIONGRAPH_SK }}
+          HUAWEI_PROJECT_ID: ${{ vars.HUAWEI_PROJECT_ID }}
+          HUAWEI_FUNCTION_URN: ${{ vars.HUAWEI_FUNCTION_URN }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+
+          from huaweicloudsdkcore.auth.credentials import BasicCredentials
+          from huaweicloudsdkcore.exceptions import exceptions
+          from huaweicloudsdkfunctiongraph.v2 import FunctionGraphClient, InvokeFunctionRequest
+          from huaweicloudsdkfunctiongraph.v2.region.functiongraph_region import FunctionGraphRegion
+
+          region = os.environ['HUAWEI_REGION']
+          ak = os.environ.get('HUAWEI_AK', '')
+          sk = os.environ.get('HUAWEI_SK', '')
+          project_id = os.environ.get('HUAWEI_PROJECT_ID', '')
+          urn = os.environ.get('HUAWEI_FUNCTION_URN', '')
+
+          if not all((ak, sk, project_id, urn)):
+              sys.exit('Missing Huawei Actions secrets or repository variables.')
+          if len(project_id) != 32 or not project_id.isalnum():
+              sys.exit('HUAWEI_PROJECT_ID must be the 32-character Shanghai 1 project ID.')
+          if not urn.startswith(f'urn:fss:{region}:{project_id}:'):
+              sys.exit('HUAWEI_FUNCTION_URN does not match the selected region/project.')
+
+          credentials = BasicCredentials(ak, sk, project_id)
+          client = (FunctionGraphClient.new_builder()
+                    .with_credentials(credentials)
+                    .with_region(FunctionGraphRegion.value_of(region))
+                    .build())
+
+          request = InvokeFunctionRequest()
+          request.function_urn = urn
+          request.body = {'purpose': 'read_only_nationwide_api_test'}
+          request.x_cff_request_version = 'v1'
+
+          try:
+              response = client.invoke_function(request)
+          except exceptions.ClientRequestException as err:
+              print(f'FunctionGraph API error: HTTP {err.status_code}, '
+                    f'code={err.error_code}, message={str(err.error_msg)[:240]}')
+              sys.exit(1)
+
+          status = getattr(response, 'status', None)
+          print(f'FunctionGraph invocation status: {status}')
+          print(f'Huawei request ID: {getattr(response, "request_id", "unknown")}')
+
+          def unpack(value):
+              for _ in range(4):
+                  if isinstance(value, str):
+                      try:
+                          value = json.loads(value)
+                      except json.JSONDecodeError:
+                          return value
+                  elif isinstance(value, dict) and 'statusCode' in value and 'body' in value:
+                      value = value['body']
+                  elif isinstance(value, dict) and 'result' in value and 'ok' not in value:
+                      value = value['result']
+                  else:
+                      break
+              return value
+
+          result = unpack(getattr(response, 'result', None))
+          if isinstance(result, dict):
+              print('Returned metadata keys:', ', '.join(sorted(result)))
+          else:
+              sys.exit('The function response was not a JSON object.')
+
+          if result.get('ok') is not True:
+              sys.exit('The function did not report a successful CNEMC retrieval.')
+          if status is not None and str(status) != '200':
+              sys.exit('FunctionGraph returned a non-success invocation status.')
+
+          rows = result.get('total_rows')
+          pages = result.get('total_pages')
+          checksum = result.get('snapshot_md5_r_compatible')
+          if (not isinstance(rows, int) or rows <= 0 or
+                  not isinstance(pages, int) or pages <= 0 or
+                  not isinstance(checksum, str) or len(checksum) != 32):
+              sys.exit('Missing or invalid nationwide metadata in function result.')
+
+          summary = {
+              'region': region,
+              'nationwide_rows': rows,
+              'pages': pages,
+              'header_columns': result.get('header_columns'),
+              'snapshot_md5': checksum,
+              'collection_seconds': result.get('elapsed_seconds'),
+              'backup_updated': False,
+          }
+          print('PASS: GitHub authenticated and invoked Huawei FunctionGraph.')
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
