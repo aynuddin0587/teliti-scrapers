@@ -1,0 +1,116 @@
+name: Huawei FunctionGraph API connectivity test
+
+# Manual-only test: no Huawei credentials, no function invocation, no archive writes.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: huawei-functiongraph-api-smoketest
+  cancel-in-progress: false
+
+jobs:
+  test-huawei-api:
+    name: GitHub to Huawei Shanghai 1 API
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    env:
+      HUAWEI_REGION: cn-east-3
+      FUNCTIONGRAPH_HOST: functiongraph.cn-east-3.myhuaweicloud.com
+      IAM_HOST: iam.cn-east-3.myhuaweicloud.com
+
+    steps:
+      - name: Check DNS resolution
+        shell: bash
+        run: |
+          echo "Testing Huawei Cloud region: ${HUAWEI_REGION} (Shanghai 1)"
+          echo "UTC time: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          echo "Runner: ${RUNNER_OS} / ${RUNNER_ARCH}"
+          echo
+          echo 'FunctionGraph DNS:'
+          getent ahostsv4 "${FUNCTIONGRAPH_HOST}" || true
+          echo
+          echo 'IAM DNS:'
+          getent ahostsv4 "${IAM_HOST}" || true
+
+      - name: Test HTTPS reachability (no credentials)
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          # A syntactically valid but intentionally fictitious 32-character
+          # project ID makes this a read-only GET to the documented API route.
+          # HTTP 400/401/403/404 still confirms that a remote HTTPS server
+          # responded. It does NOT mean authentication or invocation works.
+          fake_project_id=00000000000000000000000000000000
+          fg_url="https://${FUNCTIONGRAPH_HOST}/v2/${fake_project_id}/fgs/functions"
+          iam_url="https://${IAM_HOST}/v3/auth/tokens"
+
+          echo '## GitHub -> Huawei Cloud connectivity' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo '| Service | Network result | HTTP code | Remote IP | TCP (s) | TLS (s) | Total (s) |' >> "$GITHUB_STEP_SUMMARY"
+          echo '|---|---|---:|---|---:|---:|---:|' >> "$GITHUB_STEP_SUMMARY"
+
+          probe() {
+            local label="$1"
+            local url="$2"
+            local curl_rc metrics http_code remote_ip tcp tls total state
+
+            echo
+            echo "===== ${label} ====="
+            echo "GET ${url}"
+
+            # Do not follow redirects. Do not disable TLS verification.
+            # Do not use --fail: authentication errors are useful here.
+            metrics=$(curl -4 --silent --show-error \
+              --connect-timeout 12 --max-time 25 \
+              --output /dev/null \
+              --write-out '%{http_code} %{remote_ip} %{time_connect} %{time_appconnect} %{time_total}' \
+              --request GET "${url}")
+            curl_rc=$?
+            read -r http_code remote_ip tcp tls total <<< "$metrics"
+
+            http_code="${http_code:-000}"
+            remote_ip="${remote_ip:--}"
+            tcp="${tcp:-0}"
+            tls="${tls:-0}"
+            total="${total:-0}"
+
+            echo "curl_exit_code=${curl_rc}"
+            echo "http_status=${http_code}"
+            echo "remote_ip=${remote_ip}"
+            echo "tcp_seconds=${tcp}"
+            echo "tls_seconds=${tls}"
+            echo "total_seconds=${total}"
+
+            if [[ "$curl_rc" -eq 0 && "$http_code" =~ ^[1-5][0-9][0-9]$ ]]; then
+              state='REACHABLE'
+              echo "${label}: HTTPS response received (HTTP ${http_code})."
+              echo 'This demonstrates network reachability only, not API authorization.'
+            else
+              state='FAILED'
+              echo "::warning::${label}: no valid HTTPS response (curl exit ${curl_rc})."
+            fi
+
+            echo "| ${label} | ${state} | ${http_code} | ${remote_ip} | ${tcp} | ${tls} | ${total} |" >> "$GITHUB_STEP_SUMMARY"
+            [[ "$state" == 'REACHABLE' ]]
+          }
+
+          fg_ok=0
+          iam_ok=0
+          probe FunctionGraph "$fg_url" && fg_ok=1
+          probe IAM "$iam_url" && iam_ok=1
+
+          echo
+          if [[ "$fg_ok" -eq 1 && "$iam_ok" -eq 1 ]]; then
+            echo 'PASS: GitHub can reach both Huawei API endpoints over HTTPS.'
+            echo '' >> "$GITHUB_STEP_SUMMARY"
+            echo '**PASS:** Both Huawei API endpoints returned HTTP responses.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '::error::At least one Huawei API endpoint was unreachable from this runner.'
+            echo '' >> "$GITHUB_STEP_SUMMARY"
+            echo '**FAIL:** At least one Huawei API endpoint did not return an HTTPS response.' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
