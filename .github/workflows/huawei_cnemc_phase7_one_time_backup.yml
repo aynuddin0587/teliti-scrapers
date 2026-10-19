@@ -1,0 +1,604 @@
+# Phase 7: one-time REAL CNEMC backup (not scheduled).
+# This is the first controlled production write, after Phase 6 continuity PASS.
+# The existing CNEMC schedule and other collectors are unchanged.
+name: Huawei CNEMC Phase 7 - one-time persistent backup
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_write:
+        description: 'Type PERSIST_CNEMC_ONCE to permit one persistent private-backup write'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# MATCH the existing direct-CNEMC workflow to prevent overlapping CNEMC writes.
+concurrency:
+  group: cnemc-surfacewater-backup
+  cancel-in-progress: false
+
+jobs:
+  persist-once:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+
+    env:
+      HUAWEI_REGION: cn-east-3
+      TZ: Asia/Taipei
+      TELITI_TIMEZONE: Asia/Taipei
+      TELITI_COLLECTOR_ID: huawei_functiongraph_via_github
+      CNEMC_DELTA_AREAS: "福建省"
+      CNEMC_AREA_ID: ""
+      CNEMC_RIVER_ID: ""
+      CNEMC_MN_NAME: ""
+      CNEMC_PAGE_SIZE: "2000"
+      CNEMC_SNAPSHOT_ATTEMPTS: "1"
+      CNEMC_IMPORT_MAX_AGE_SEC: "900"
+      TELITI_BACKUP_REPO: ${{ github.workspace }}/teliti-data-backup
+
+    steps:
+      - name: Require explicit one-time write confirmation
+        shell: bash
+        env:
+          CONFIRM_WRITE: ${{ inputs.confirm_write }}
+        run: |
+          set -euo pipefail
+          if [[ "${CONFIRM_WRITE}" != 'PERSIST_CNEMC_ONCE' ]]; then
+            echo '::error::No permission to write to the private backup; incorrect confirmation.'
+            exit 1
+          fi
+          echo 'One-time private backup write explicitly authorized.'
+
+      - name: Check out exact source workflow commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out private data backup with existing SSH deploy key
+        uses: actions/checkout@v7
+        with:
+          repository: aynuddin0587/teliti-data-backup
+          ref: main
+          path: teliti-data-backup
+          ssh-key: ${{ secrets.TELITI_DATA_DEPLOY_KEY }}
+          persist-credentials: true
+          fetch-depth: 20
+
+      - name: Verify scripts, private destination, and clean initial checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in \
+            .github/scripts/huawei_cnemc_transfer.py \
+            .github/phase5/02_nmemc_surfacewater_huawei_trial.R \
+            .github/scripts/prepare_cnemc_backup.R \
+            .github/scripts/push_backup_with_retry.sh \
+            .github/scripts/stabilize_ubuntu_apt.sh; do
+            test -f "${file}" || { echo "::error::Missing file: ${file}"; exit 1; }
+          done
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}" || {
+            echo '::error::Source checkout differs from the workflow triggering commit.'; exit 1;
+          }
+          test -d "${TELITI_BACKUP_REPO}/.git"
+          test "$(git -C "${TELITI_BACKUP_REPO}" branch --show-current)" = main
+          remote="$(git -C "${TELITI_BACKUP_REPO}" remote get-url origin)"
+          case "${remote}" in
+            *aynuddin0587/teliti-data-backup*) ;;
+            *) echo '::error::Refusing to write to an unexpected Git remote.'; exit 1 ;;
+          esac
+          test -z "$(git -C "${TELITI_BACKUP_REPO}" status --porcelain)" || {
+            echo '::error::Private checkout is already modified.'; exit 1;
+          }
+          echo "Scraper source revision: ${GITHUB_SHA}"
+          echo "Initial private backup revision: $(git -C "${TELITI_BACKUP_REPO}" rev-parse HEAD)"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install Huawei FunctionGraph Python SDK
+        shell: bash
+        run: python -m pip install --disable-pip-version-check huaweicloudsdkfunctiongraph
+
+      - name: Stabilize Ubuntu apt network
+        shell: bash
+        timeout-minutes: 2
+        run: bash .github/scripts/stabilize_ubuntu_apt.sh
+
+      - name: Set up R 4.6.1
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: '4.6.1'
+          use-public-rspm: true
+
+      - name: Restore existing R project packages
+        uses: r-lib/actions/setup-renv@v2
+
+      - name: Initialize private-backup baseline and isolated collection workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d "${RUNNER_TEMP}/cnemc_phase7_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_XXXXXX")"
+          data_root="${root}/run-data"
+          surface="${data_root}/nmemc/data/surfacewater"
+          {
+            echo "PHASE7_ROOT=${root}"
+            echo "TELITI_DATA_ROOT=${data_root}"
+            echo "CNEMC_SURFACE_DIR=${surface}"
+            echo "CNEMC_IMPORT_MANIFEST=${root}/transport/manifest.json"
+          } >> "${GITHUB_ENV}"
+          mkdir -p "${surface}"
+          git -C "${TELITI_BACKUP_REPO}" rev-parse HEAD > "${root}/private_backup_base_head.txt"
+          echo 'No private backup writes have occurred yet.'
+
+      - name: Record baseline of EXISTING persistent CNEMC files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, hashlib, json, os
+          from pathlib import Path
+
+          root = Path(os.environ['PHASE7_ROOT'])
+          cn = Path(os.environ['TELITI_BACKUP_REPO']) / 'cnemc_surfacewater'
+          def count_rows(rel):
+              path = cn / rel
+              if not path.exists():
+                  return 0
+              with path.open(encoding='utf-8-sig', newline='') as stream:
+                  return sum(1 for _ in csv.DictReader(stream))
+          def first_line(rel):
+              path = cn / rel
+              return path.read_text(encoding='utf-8').splitlines()[0].strip() if path.exists() and path.stat().st_size else ''
+          original_files = {}
+          if cn.exists():
+              for path in cn.rglob('*'):
+                  if path.is_file():
+                      rel = path.relative_to(cn).as_posix()
+                      content = path.read_bytes()
+                      original_files[rel] = {
+                          'bytes': len(content),
+                          'sha256': hashlib.sha256(content).hexdigest(),
+                      }
+          baseline = {
+              'files': original_files,
+              'collection_rows': count_rows('manifests/collection_manifest.csv'),
+              'snapshot_rows': count_rows('manifests/snapshot_manifest.csv'),
+              'delta_rows': count_rows('manifests/targeted_delta_manifest.csv'),
+              'previous_md5': first_line('state/latest_snapshot_md5.txt'),
+              'previous_full_bucket': first_line('state/latest_full_checkpoint_bucket.txt'),
+              'index_existed': (cn / 'indexes/row_version_index.csv').exists(),
+              'baseline_existed': (cn / 'state/delta_baseline_path.txt').exists(),
+              'membership_existed': (cn / 'state/latest_row_membership.csv').exists(),
+          }
+          (root / 'baseline.json').write_text(json.dumps(baseline, indent=2), encoding='utf-8')
+          print('Prior successful collection entries:', baseline['collection_rows'])
+          print('Prior snapshot manifest entries:', baseline['snapshot_rows'])
+          print('Prior target delta manifest entries:', baseline['delta_rows'])
+          print('Existing CNEMC files copied:', len(original_files))
+          if not baseline['collection_rows'] or not baseline['snapshot_rows']:
+              print('NOTE: No complete prior success history; only bootstrap can be validated.')
+          PY
+
+
+      - name: Invoke Huawei and stage verified original CNEMC response bytes
+        id: transfer
+        continue-on-error: true
+        timeout-minutes: 3
+        shell: bash
+        env:
+          HUAWEI_AK: ${{ secrets.HUAWEI_FUNCTIONGRAPH_AK }}
+          HUAWEI_SK: ${{ secrets.HUAWEI_FUNCTIONGRAPH_SK }}
+          HUAWEI_PROJECT_ID: ${{ vars.HUAWEI_PROJECT_ID }}
+          HUAWEI_FUNCTION_URN: ${{ vars.HUAWEI_FUNCTION_URN }}
+        run: |
+          set -euo pipefail
+          python .github/scripts/huawei_cnemc_transfer.py --output "${PHASE7_ROOT}/transport"
+          test -s "${CNEMC_IMPORT_MANIFEST}"
+
+      - name: Process verified Huawei snapshot in isolated R archive
+        id: archive
+        if: ${{ steps.transfer.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${CNEMC_SURFACE_DIR}" in
+            "${RUNNER_TEMP}"/cnemc_phase7_*/run-data/nmemc/data/surfacewater) ;;
+            *) echo '::error::Unsafe source archive location'; exit 1 ;;
+          esac
+          Rscript .github/phase5/02_nmemc_surfacewater_huawei_trial.R
+
+      - name: Apply existing Fujian-delta and six-hour-checkpoint policy locally
+        id: prepare
+        if: ${{ steps.archive.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${TELITI_BACKUP_REPO}" = "${GITHUB_WORKSPACE}/teliti-data-backup"
+          test -d "${TELITI_BACKUP_REPO}/.git"
+          Rscript .github/scripts/prepare_cnemc_backup.R
+
+      - name: Validate R source provenance and current snapshot
+        id: r_validation
+        if: ${{ steps.prepare.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "${PHASE7_ROOT}/validate_r.R" <<'RS'
+          root <- Sys.getenv('PHASE7_ROOT')
+          surface <- Sys.getenv('CNEMC_SURFACE_DIR')
+          source <- file.path(surface, 'source')
+          processed <- file.path(surface, 'processed')
+          manifest <- jsonlite::fromJSON(Sys.getenv('CNEMC_IMPORT_MANIFEST'), simplifyVector = FALSE)
+          meta <- readRDS(file.path(source, 'surfacewater_current_meta.rds'))
+          raw <- readRDS(file.path(source, 'surfacewater_current_raw.rds'))
+          dat <- readRDS(file.path(processed, 'nmemc_surfacewater_current.rds'))
+          runs <- read.csv(file.path(processed, 'nmemc_surfacewater_run_manifest.csv'),
+                           colClasses = 'character', check.names = FALSE)
+          stopifnot(
+            nrow(dat) > 0L,
+            length(raw$pages) == raw$total_pages,
+            identical(as.character(meta$snapshot_md5), as.character(manifest$snapshot_md5)),
+            identical(as.character(raw$snapshot_md5), as.character(manifest$snapshot_md5)),
+            identical(as.character(meta$source_collector), 'huawei_functiongraph'),
+            identical(as.character(meta$source_region), 'cn-east-3'),
+            identical(as.character(raw$source_transport), 'cnemc-source-files-v1'),
+            identical(as.character(raw$source_checked_at_utc), as.character(manifest$source_checked_at_utc)),
+            nzchar(as.character(raw$github_ingested_at_utc)),
+            nrow(runs) == 1L,
+            identical(as.character(tail(runs$source_collector, 1)), 'huawei_functiongraph')
+          )
+          cat('PASS: R import retained original Huawei provenance and checksum.\n')
+          cat('Rows:', nrow(dat), '| Pages:', raw$total_pages,
+              '| Snapshot MD5:', raw$snapshot_md5, '\n')
+          RS
+          Rscript "${PHASE7_ROOT}/validate_r.R"
+
+
+      - name: Verify historical integrity and retention BEFORE private push
+        id: validate
+        if: ${{ steps.r_validation.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, gzip, hashlib, json, os, sys
+          from datetime import datetime, timezone, timedelta
+          from pathlib import Path
+
+          root = Path(os.environ['PHASE7_ROOT'])
+          cn = Path(os.environ['TELITI_BACKUP_REPO']) / 'cnemc_surfacewater'
+          baseline = json.loads((root / 'baseline.json').read_text(encoding='utf-8'))
+          transfer = json.loads((root / 'transport' / 'manifest.json').read_text(encoding='utf-8'))
+
+          def require(condition, message):
+              if not condition:
+                  raise AssertionError(message)
+          def rows(rel):
+              path = cn / rel
+              if not path.exists():
+                  return []
+              with path.open(encoding='utf-8-sig', newline='') as stream:
+                  return list(csv.DictReader(stream))
+          def digest_of_prefix(path, size):
+              with path.open('rb') as stream:
+                  return hashlib.sha256(stream.read(size)).hexdigest()
+
+          # Every previously stored immutable checkpoint, delta, dictionary and
+          # failure diagnostic must remain byte-for-byte unchanged. Existing
+          # manifests and the row-version index may grow, but never be rewritten.
+          for rel, original in baseline['files'].items():
+              path = cn / rel
+              require(path.is_file(), f'Previously archived file vanished: {rel}')
+              parts = Path(rel).parts
+              if parts[0] == 'state':
+                  continue  # Latest-state pointers and memberships can change.
+              if parts[0] == 'manifests' or rel == 'indexes/row_version_index.csv':
+                  require(path.stat().st_size >= original['bytes'], f'Old manifest/index truncated: {rel}')
+                  require(digest_of_prefix(path, original['bytes']) == original['sha256'],
+                          f'Old manifest/index contents were rewritten: {rel}')
+              else:
+                  require(path.stat().st_size == original['bytes'] and
+                          digest_of_prefix(path, original['bytes']) == original['sha256'],
+                          f'Previously archived content changed: {rel}')
+
+          collections = rows('manifests/collection_manifest.csv')
+          snapshots = rows('manifests/snapshot_manifest.csv')
+          deltas = rows('manifests/targeted_delta_manifest.csv')
+          require(len(collections) == baseline['collection_rows'] + 1,
+                  'Expected one new collection manifest entry for this GitHub run')
+          latest = collections[-1]
+          require(latest.get('snapshot_md5') == transfer['snapshot_md5'],
+                  'Collection checksum differs from source transfer')
+          require(latest.get('collector_id') == 'huawei_functiongraph_via_github',
+                  'Collection provenance was not retained')
+          require(latest.get('collection_key') == f"{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}",
+                  'Collection key does not match the GitHub invocation')
+
+          source_time = datetime.fromisoformat(transfer['source_checked_at_utc'].replace('Z', '+00:00'))
+          local_time = source_time.astimezone(timezone(timedelta(hours=8)))
+          current_bucket = local_time.strftime('%Y%m%d') + '_' + f'{(local_time.hour // 6) * 6:02d}'
+          changed = baseline['previous_md5'] != transfer['snapshot_md5']
+          new_checkpoint = changed and baseline['previous_full_bucket'] != current_bucket
+          bootstrap = not all((baseline['index_existed'], baseline['baseline_existed'], baseline['membership_existed']))
+
+          require(latest.get('changed') == str(changed).upper(), 'Incorrect snapshot changed flag')
+          require(latest.get('full_checkpoint_retained') == str(new_checkpoint).upper(),
+                  'Six-hour full checkpoint retention differs from existing policy')
+          require(latest.get('retention_bucket') == current_bucket, 'Incorrect retention bucket')
+          require(len(snapshots) == baseline['snapshot_rows'] + int(changed),
+                  'Unexpected number of source snapshot manifest entries')
+          require(len(deltas) == baseline['delta_rows'] + int(bootstrap or changed),
+                  'Unexpected number of targeted delta manifest entries')
+
+          if new_checkpoint:
+              latest_snapshot = snapshots[-1]
+              for name in ('raw_file', 'processed_file'):
+                  rel = latest_snapshot.get(name, '')
+                  require(rel and (Path(os.environ['TELITI_BACKUP_REPO']) / rel).is_file(),
+                          f'Checkpoint missing: {name}')
+          if len(deltas) > baseline['delta_rows']:
+              delta = deltas[-1]
+              require(delta.get('target_areas') == '福建省', 'Target scope unexpectedly changed')
+              rel = delta.get('row_versions_file', '')
+              if rel:
+                  path = Path(os.environ['TELITI_BACKUP_REPO']) / rel
+                  require(path.is_file(), 'Delta manifest references nonexistent file')
+                  if '/deltas/targeted/' in '/' + rel.replace('\\', '/'):
+                      with gzip.open(path, mode='rt', encoding='utf-8', newline='') as stream:
+                          targeted = list(csv.DictReader(stream))
+                      require(all(row.get('area') == '福建省' for row in targeted),
+                              'Targeted delta contains a non-Fujian row')
+
+          (root / 'post_first_pass_files.json').write_text(json.dumps({
+              p.relative_to(cn).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in cn.rglob('*') if p.is_file()
+          }, indent=2), encoding='utf-8')
+          report = {
+              'base_collection_rows': baseline['collection_rows'],
+              'new_collection_rows': len(collections) - baseline['collection_rows'],
+              'prior_success_history_available': bool(baseline['collection_rows'] and baseline['snapshot_rows']),
+              'snapshot_changed': changed,
+              'full_checkpoint_retained': new_checkpoint,
+              'targeted_delta_manifest_new_rows': len(deltas) - baseline['delta_rows'],
+              'nationwide_rows': transfer['total_rows'],
+              'snapshot_md5': transfer['snapshot_md5'],
+              'retention_bucket': current_bucket,
+          }
+          (root / 'phase6_report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+          print('PASS: prior immutable data untouched, existing manifests preserved, policy verified')
+          print(json.dumps(report, indent=2))
+          PY
+
+          # Refuse to commit changes outside CNEMC, including other collectors' files.
+          python - <<'PY'
+          import os, subprocess
+          root = os.environ['TELITI_BACKUP_REPO']
+          changed = subprocess.check_output(
+              ['git','-C',root,'status','--porcelain','--untracked-files=all'], text=True
+          )
+          paths = [line[3:] for line in changed.splitlines() if len(line)>3]
+          if not paths:
+              raise SystemExit('No prepared CNEMC changes: expected a new collection manifest entry')
+          other = [p for p in paths if not p.startswith('cnemc_surfacewater/')]
+          if other:
+              raise SystemExit('Refusing to stage non-CNEMC changes: ' + repr(other[:5]))
+          print('PASS: every candidate file is within cnemc_surfacewater/')
+          PY
+
+
+      # If the source or archive failed, discard ALL partially prepared local
+      # CNEMC changes, then append failure attempts under diagnostics only.
+      # A source failure must never be written as an unchanged water snapshot.
+      - name: Record failed attempt without retaining incomplete archive
+        id: record_failure
+        if: ${{ !cancelled() && (steps.transfer.outcome == 'failure' || steps.archive.outcome == 'failure' || steps.prepare.outcome == 'failure' || steps.r_validation.outcome == 'failure' || steps.validate.outcome == 'failure') }}
+        timeout-minutes: 2
+        shell: bash
+        env:
+          TRANSFER_OUTCOME: ${{ steps.transfer.outcome }}
+          ARCHIVE_OUTCOME: ${{ steps.archive.outcome }}
+          PREPARE_OUTCOME: ${{ steps.prepare.outcome }}
+          R_VALIDATION_OUTCOME: ${{ steps.r_validation.outcome }}
+          VALIDATION_OUTCOME: ${{ steps.validate.outcome }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, os, subprocess
+          from pathlib import Path
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          repo = Path(os.environ['TELITI_BACKUP_REPO'])
+          root = Path(os.environ['CNEMC_SURFACE_DIR'])
+          possible = root / 'manifests' / 'attempt_manifest.csv'
+          collected = []
+          fields = ['collection_key', 'github_run_id', 'github_run_attempt',
+                    'recorded_at', 'attempt', 'status', 'error_class',
+                    'error_message', 'snapshot_md5', 'rows']
+          if possible.exists():
+              with possible.open(encoding='utf-8-sig', newline='') as stream:
+                  reader = csv.DictReader(stream)
+                  if reader.fieldnames == fields:
+                      collected = [dict(r) for r in reader
+                                   if r.get('status') in ('failed','archive_failed')]
+                  else:
+                      print('WARNING: local R attempt schema differs; synthetic failure will be recorded.')
+
+          if os.environ['TRANSFER_OUTCOME'] == 'failure':
+              reason = 'huawei_transfer_failure'
+          elif os.environ['ARCHIVE_OUTCOME'] == 'failure':
+              reason = 'r_archive_failure'
+          elif os.environ['PREPARE_OUTCOME'] == 'failure':
+              reason = 'backup_preparation_failure'
+          else:
+              reason = 'backup_pre_push_validation_failure'
+
+          # Do not push partially prepared archives when preparation/validation fails.
+          tracked = subprocess.check_output(
+              ['git','-C',str(repo),'ls-files','--','cnemc_surfacewater'],
+              text=True
+          ).strip()
+          if tracked:
+              subprocess.run(['git','-C',str(repo),'restore','--staged','--worktree',
+                              '--','cnemc_surfacewater'], check=True)
+          subprocess.run(['git','-C',str(repo),'clean','-fd','--','cnemc_surfacewater/'],
+                         check=True, stdout=subprocess.DEVNULL)
+
+          now = datetime.now(ZoneInfo('Asia/Shanghai'))
+          rid = os.environ['GITHUB_RUN_ID']
+          attempt = os.environ['GITHUB_RUN_ATTEMPT']
+          run_key = rid + '-' + attempt
+          timestamp = now.strftime('%Y-%m-%d %H:%M:%S%z')
+          # Always add a workflow-level failure record even if R wrote detailed
+          # per-attempt rows, because these are different stages of failure.
+          collected.append(dict(zip(fields, [run_key, rid, attempt, timestamp,
+                                             '0','failed',reason,
+                                             'Phase 7 ' + reason + '; see Actions log',
+                                             '', ''])))
+          dest_dir = repo / 'cnemc_surfacewater' / 'diagnostics'
+          dest_dir.mkdir(parents=True, exist_ok=True)
+          dest = dest_dir / f'failed_attempts_{now:%Y%m}.csv'
+          prior=[]
+          if dest.exists():
+              with dest.open(encoding='utf-8-sig',newline='') as stream:
+                  old=csv.DictReader(stream)
+                  if old.fieldnames != fields:
+                      raise RuntimeError('Private failure diagnostic schema differs; refusing modification')
+                  prior=list(old)
+          seen={(r['collection_key'],r['attempt'],r['status'],r['error_class'])
+                for r in prior}
+          fresh=[]
+          for r in collected:
+              k=(r['collection_key'],r['attempt'],r['status'],r['error_class'])
+              if k not in seen:
+                  fresh.append({f: r.get(f,'') for f in fields})
+                  seen.add(k)
+          if fresh:
+              with dest.open('a',encoding='utf-8',newline='') as stream:
+                  writer=csv.DictWriter(stream,fieldnames=fields)
+                  if not prior and dest.stat().st_size == 0:
+                      writer.writeheader()
+                  writer.writerows(fresh)
+          if not fresh:
+              print('Failure diagnostic already present: no duplicated rows')
+          else:
+              print(f'Prepared {len(fresh)} failure record(s), no source checkpoint: {dest.name}')
+          PY
+
+      # The ONLY stage allowed to modify the remote private repository.
+      # Shares the original retry-safe helper and the direct CNEMC concurrency group.
+      - name: Commit and push validated CNEMC changes or failure diagnostics
+        id: push
+        if: ${{ !cancelled() && (steps.validate.outcome == 'success' || steps.record_failure.outcome == 'success') }}
+        continue-on-error: true
+        timeout-minutes: 7
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/scripts/push_backup_with_retry.sh             "${TELITI_BACKUP_REPO}"             'cnemc_surfacewater/'             "Huawei CNEMC one-time backup ${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+      - name: Verify pushed revision is reachable on remote main
+        id: verify_push
+        if: ${{ !cancelled() && steps.push.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$(cat "${PHASE7_ROOT}/private_backup_base_head.txt")"
+          current="$(git -C "${TELITI_BACKUP_REPO}" rev-parse HEAD)"
+          if [[ "${base}" == "${current}" ]]; then
+            echo '::error::No new private backup commit was created.'
+            exit 1
+          fi
+          git -C "${TELITI_BACKUP_REPO}" fetch --quiet origin main
+          remote="$(git -C "${TELITI_BACKUP_REPO}" rev-parse refs/remotes/origin/main)"
+          git -C "${TELITI_BACKUP_REPO}" merge-base --is-ancestor "${current}" "${remote}" || {
+            echo '::error::New backup commit is not in the remote main history.'
+            exit 1
+          }
+          test -z "$(git -C "${TELITI_BACKUP_REPO}" status --porcelain)" || {
+            echo '::error::Backup checkout remains dirty after push.'
+            exit 1
+          }
+          echo "Confirmed remote contains private CNEMC backup commit: ${current}"
+          {
+            echo '## Huawei CNEMC Phase 7 — one-time private backup'
+            echo ''
+            echo "- Remote backup commit: \`${current}\`"
+            echo '- Destination: private teliti-data-backup, cnemc_surfacewater/ only'
+            echo '- Production schedule: unchanged'
+            echo '- Retention: Fujian targeted deltas and six-hour nationwide checkpoints'
+            if [[ -f "${PHASE7_ROOT}/phase6_report.json" ]]; then
+              python - <<'PY'
+          import json, os
+          from pathlib import Path
+          info = json.loads((Path(os.environ['PHASE7_ROOT']) / 'phase6_report.json').read_text())
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as out:
+              out.write(f'- Nationwide rows: {info["nationwide_rows"]}\n')
+              out.write(f'- Snapshot changed: {info["snapshot_changed"]}\n')
+              out.write(f'- Full checkpoint retained: {info["full_checkpoint_retained"]}\n')
+              out.write(f'- New Fujian delta manifest rows: {info["targeted_delta_manifest_new_rows"]}\n')
+              out.write(f'- Snapshot MD5: `{info["snapshot_md5"]}`\n')
+          PY
+            else
+              echo '- **Collection failed; only diagnostics were persisted, not water data.**'
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload diagnostic logs if Phase 7 fails
+        if: ${{ always() && (steps.transfer.outcome == 'failure' || steps.archive.outcome == 'failure' || steps.prepare.outcome == 'failure' || steps.r_validation.outcome == 'failure' || steps.validate.outcome == 'failure' || steps.push.outcome == 'failure' || steps.verify_push.outcome == 'failure') }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: huawei-cnemc-phase7-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/cnemc_phase7_*/run-data/nmemc/data/surfacewater/manifests/attempt_manifest.csv
+            ${{ runner.temp }}/cnemc_phase7_*/run-data/nmemc/data/surfacewater/log/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Report final persistent-backup outcome
+        if: ${{ always() && !cancelled() }}
+        shell: bash
+        env:
+          TRANSFER: ${{ steps.transfer.outcome }}
+          ARCHIVE: ${{ steps.archive.outcome }}
+          PREPARE: ${{ steps.prepare.outcome }}
+          R_VALIDATION: ${{ steps.r_validation.outcome }}
+          VALIDATION: ${{ steps.validate.outcome }}
+          PUSH: ${{ steps.push.outcome }}
+          VERIFY: ${{ steps.verify_push.outcome }}
+        run: |
+          set -euo pipefail
+          if [[ "${TRANSFER}" == 'success' && "${ARCHIVE}" == 'success' &&                 "${PREPARE}" == 'success' && "${R_VALIDATION}" == 'success' &&                 "${VALIDATION}" == 'success' && "${PUSH}" == 'success' &&                 "${VERIFY}" == 'success' ]]; then
+            echo 'PASS: one-time Huawei CNEMC observation archived and verified in private backup.'
+          else
+            echo '::error::Phase 7 did not complete a verified successful CNEMC backup.'
+            echo "Stages: transfer=${TRANSFER}, archive=${ARCHIVE}, prepare=${PREPARE}, r_validation=${R_VALIDATION}, validate=${VALIDATION}, push=${PUSH}, verify=${VERIFY}"
+            echo 'If failure diagnostics were pushed, this remains a FAILED collection (not unchanged water data).'
+            exit 1
+          fi
+
+      - name: Remove temporary Huawei source responses and R output
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${PHASE7_ROOT:-}" && -d "${PHASE7_ROOT}" ]]; then
+            case "${PHASE7_ROOT}" in
+              "${RUNNER_TEMP}"/cnemc_phase7_*) rm -rf -- "${PHASE7_ROOT}" ;;
+              *) echo '::error::Unsafe cleanup path; refusing deletion.'; exit 1 ;;
+            esac
+          fi
