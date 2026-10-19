@@ -1,0 +1,170 @@
+name: Huawei CNEMC Phase 5 - R archive dry run
+
+# Trial only: not the production CNEMC workflow; no schedule or repository push.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: huawei-cnemc-phase5-dry-run
+  cancel-in-progress: false
+
+jobs:
+  phase5-dry-run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    env:
+      HUAWEI_REGION: cn-east-3
+      TELITI_TIMEZONE: Asia/Taipei
+      TZ: Asia/Taipei
+      TELITI_COLLECTOR_ID: huawei_functiongraph_via_github
+      CNEMC_DELTA_AREAS: "福建省"
+      CNEMC_AREA_ID: ""
+      CNEMC_RIVER_ID: ""
+      CNEMC_MN_NAME: ""
+      CNEMC_PAGE_SIZE: "2000"
+      CNEMC_SNAPSHOT_ATTEMPTS: "1"
+      CNEMC_IMPORT_MAX_AGE_SEC: "900"
+
+    steps:
+      - name: Checkout scraper repository (no private backup checkout)
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install Huawei FunctionGraph SDK
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check huaweicloudsdkfunctiongraph
+
+      - name: Stabilize Ubuntu apt network (reuse current CNEMC setup)
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          bash .github/scripts/stabilize_ubuntu_apt.sh
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: '4.6.1'
+          use-public-rspm: true
+
+      - name: Restore existing R project packages
+        uses: r-lib/actions/setup-renv@v2
+
+      - name: Set up ISOLATED temporary archive and Git backup
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d "${RUNNER_TEMP}/cnemc_phase5_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_XXXXXX")"
+          echo "PHASE5_ROOT=${root}" >> "${GITHUB_ENV}"
+          echo "TELITI_DATA_ROOT=${root}/run-data" >> "${GITHUB_ENV}"
+          echo "CNEMC_SURFACE_DIR=${root}/run-data/nmemc/data/surfacewater" >> "${GITHUB_ENV}"
+          echo "TELITI_BACKUP_REPO=${root}/fake-private-backup" >> "${GITHUB_ENV}"
+          echo "CNEMC_IMPORT_MANIFEST=${root}/transport/manifest.json" >> "${GITHUB_ENV}"
+          mkdir -p "${root}/run-data/nmemc/data/surfacewater"
+          git init -q "${root}/fake-private-backup"
+          echo 'Isolated dry-run directories initialized. No production archive is mounted.'
+
+      - name: Invoke Huawei and stage verified source bytes
+        timeout-minutes: 3
+        shell: bash
+        env:
+          HUAWEI_AK: ${{ secrets.HUAWEI_FUNCTIONGRAPH_AK }}
+          HUAWEI_SK: ${{ secrets.HUAWEI_FUNCTIONGRAPH_SK }}
+          HUAWEI_PROJECT_ID: ${{ vars.HUAWEI_PROJECT_ID }}
+          HUAWEI_FUNCTION_URN: ${{ vars.HUAWEI_FUNCTION_URN }}
+        run: |
+          set -euo pipefail
+          python .github/scripts/huawei_cnemc_transfer.py --output "${PHASE5_ROOT}/transport"
+          test -s "${CNEMC_IMPORT_MANIFEST}"
+
+      - name: Process snapshot with existing R archival logic in Huawei import mode
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${CNEMC_SURFACE_DIR}" in
+            "${RUNNER_TEMP}"/cnemc_phase5_*/run-data/nmemc/data/surfacewater) ;;
+            *) echo '::error::Refusing to write outside isolated test directory'; exit 1 ;;
+          esac
+          Rscript .github/phase5/02_nmemc_surfacewater_huawei_trial.R
+
+      - name: Prepare backup using UNMODIFIED current helper in FAKE Git repository
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${TELITI_BACKUP_REPO}" in
+            "${RUNNER_TEMP}"/cnemc_phase5_*/fake-private-backup) ;;
+            *) echo '::error::Refusing to run backup helper outside temporary directory'; exit 1 ;;
+          esac
+          test -d "${TELITI_BACKUP_REPO}/.git"
+          Rscript .github/scripts/prepare_cnemc_backup.R
+
+      - name: Validate provenance, records and unchanged retention policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "${PHASE5_ROOT}/validate_phase5.R" <<'RS'
+          surface <- Sys.getenv("CNEMC_SURFACE_DIR")
+          backup <- Sys.getenv("TELITI_BACKUP_REPO")
+          meta <- readRDS(file.path(surface, "source", "surfacewater_current_meta.rds"))
+          raw <- readRDS(file.path(surface, "source", "surfacewater_current_raw.rds"))
+          dat <- readRDS(file.path(surface, "processed", "nmemc_surfacewater_current.rds"))
+          runs <- read.csv(file.path(surface, "processed", "nmemc_surfacewater_run_manifest.csv"),
+                           colClasses = "character", check.names = FALSE)
+          collections <- read.csv(file.path(backup, "cnemc_surfacewater", "manifests", "collection_manifest.csv"),
+                                  colClasses = "character", check.names = FALSE)
+          snapshots <- read.csv(file.path(backup, "cnemc_surfacewater", "manifests", "snapshot_manifest.csv"),
+                                colClasses = "character", check.names = FALSE)
+          stopifnot(nrow(dat) > 0L, length(raw$pages) == raw$total_pages,
+                    nrow(runs) == 1L, nrow(collections) == 1L, nrow(snapshots) == 1L,
+                    identical(meta$snapshot_md5, raw$snapshot_md5),
+                    identical(meta$source_collector, "huawei_functiongraph"),
+                    identical(meta$source_region, "cn-east-3"),
+                    identical(raw$source_transport, "cnemc-source-files-v1"),
+                    nzchar(raw$source_checked_at_utc), nzchar(raw$github_ingested_at_utc),
+                    identical(runs$source_collector[[1]], "huawei_functiongraph"),
+                    identical(collections$collector_id[[1]], "huawei_functiongraph_via_github"),
+                    identical(collections$full_checkpoint_retained[[1]], "TRUE"),
+                    nzchar(snapshots$raw_file[[1]]), nzchar(snapshots$processed_file[[1]]),
+                    file.exists(file.path(backup, snapshots$raw_file[[1]])),
+                    file.exists(file.path(backup, snapshots$processed_file[[1]])))
+          cat("PASS: original Huawei source bytes were processed by the current R archival logic\n")
+          cat("Rows:", nrow(dat), "| Pages:", raw$total_pages, "| MD5:", meta$snapshot_md5, "\n")
+          cat("Source collected (UTC):", raw$source_checked_at_utc, "\n")
+          cat("GitHub ingested (UTC):", raw$github_ingested_at_utc, "\n")
+          cat("PASS: backup helper produced a six-hour nationwide checkpoint\n")
+          cat("Fujian-targeted delta retention remains configured as:", Sys.getenv("CNEMC_DELTA_AREAS"), "\n")
+          RS
+          Rscript "${PHASE5_ROOT}/validate_phase5.R"
+          {
+            echo '## CNEMC Phase 5 isolated archival test'
+            echo ''
+            echo '**PASS:** Huawei import, R archive and existing backup preparation validated in a temporary Git repository.'
+            echo ''
+            echo '- Production CNEMC scraper, scheduled workflow and archive: unchanged'
+            echo '- Private teliti-data-backup: not accessed'
+            echo '- Git commits/pushes: none'
+            echo '- Backup policy: Fujian high-frequency deltas + six-hour nationwide checkpoints'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Remove temporary source responses and fake backup
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${PHASE5_ROOT:-}" && -d "${PHASE5_ROOT}" ]]; then
+            case "${PHASE5_ROOT}" in
+              "${RUNNER_TEMP}"/cnemc_phase5_*) rm -rf -- "${PHASE5_ROOT}" ;;
+              *) echo '::error::Unsafe cleanup path'; exit 1 ;;
+            esac
+          fi
+          echo 'Temporary source files and isolated fake backup removed.'
