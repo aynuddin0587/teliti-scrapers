@@ -41,6 +41,38 @@ def unwrap(value):
     return value
 
 
+def safe_diagnostic(value, maximum=240):
+    """Show a bounded, single-line diagnostic without logging source payloads."""
+    if value is None:
+        return "<not reported>"
+    if not isinstance(value, (str, int, float, bool)):
+        return f"<{type(value).__name__}; content withheld>"
+    text = " ".join(str(value).split())
+    return text[:maximum]
+
+
+def check_function_success(obj):
+    """Distinguish remote collection errors from malformed SDK responses."""
+    if not isinstance(obj, dict):
+        fail(
+            "Huawei invocation returned no JSON result object "
+            f"(result_type={type(obj).__name__}); check FunctionGraph execution logs"
+        )
+    if obj.get("ok") is not True:
+        # The function catches source exceptions and puts the reason in
+        # its 'error' field; the old helper accidentally discarded it.
+        remote_error = obj.get("error", obj.get("errorMessage", obj.get("message")))
+        fail(
+            "Huawei function did not report a complete collection: "
+            f"purpose={safe_diagnostic(obj.get('purpose'))}; "
+            f"ok={safe_diagnostic(obj.get('ok'))}; "
+            f"remote_error={safe_diagnostic(remote_error)}; "
+            f"reported_rows={safe_diagnostic(obj.get('total_rows'))}; "
+            f"reported_pages={safe_diagnostic(obj.get('total_pages'))}. "
+            "No source files or backup files were changed."
+        )
+
+
 def decode_raw(entry):
     if not isinstance(entry, dict) or entry.get("encoding") != "zlib+base64":
         fail("Invalid transport encoding")
@@ -79,8 +111,7 @@ def decode_page(raw, expected_index, expected_total):
 
 
 def validate_and_write(obj, out_dir):
-    if not isinstance(obj, dict) or obj.get("ok") is not True:
-        fail("Huawei function did not report a complete collection")
+    check_function_success(obj)
     if obj.get("purpose") != "export_raw_snapshot_v1":
         fail("Huawei function is not running Phase 4 export mode")
     filters = obj.get("request_filters")
@@ -232,6 +263,9 @@ def invoke_huawei():
     status = getattr(response, "status", None)
     if status is not None and str(status) != "200":
         fail(f"FunctionGraph invocation status was {status}")
+    function_error = getattr(response, "function_error", None)
+    if function_error:
+        fail(f"FunctionGraph reported execution error: {safe_diagnostic(function_error)}")
     return unwrap(getattr(response, "result", None))
 
 
