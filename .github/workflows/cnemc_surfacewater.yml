@@ -9,7 +9,10 @@ name: CNEMC Surface Water Backup (Huawei FunctionGraph)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "7,27,47 * * * *"
+    # Run five minutes after Qingyue's four-hour collection times.
+    # The offset avoids GitHub's busiest top-of-hour scheduling minute and
+    # staggers the cloud collection after the PC Task Scheduler run.
+    - cron: "5 0,4,8,12,16,20 * * *"
       timezone: "Asia/Taipei"
 
 permissions:
