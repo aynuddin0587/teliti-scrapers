@@ -9,10 +9,10 @@ name: CNEMC Surface Water Backup (Huawei FunctionGraph)
 on:
   workflow_dispatch:
   schedule:
-    # Run five minutes after Qingyue's four-hour collection times.
-    # The offset avoids GitHub's busiest top-of-hour scheduling minute and
-    # staggers the cloud collection after the PC Task Scheduler run.
-    - cron: "5 0,4,8,12,16,20 * * *"
+    # Run every two hours at HH:05 in Asia/Taipei (00, 02, ..., 22).
+    # The five-minute offset avoids the busiest top-of-hour minute.
+    # GitHub schedule events may still be delayed or dropped.
+    - cron: "5 */2 * * *"
       timezone: "Asia/Taipei"
 
 permissions:
@@ -532,7 +532,7 @@ jobs:
             echo ''
             echo "- Remote backup commit: \`${current}\`"
             echo '- Destination: private teliti-data-backup, cnemc_surfacewater/ only'
-            echo '- Schedule: :07 / :27 / :47 Asia/Taipei (or manual dispatch)'
+            echo '- Schedule: every 2 hours at HH:05 Asia/Taipei (or manual dispatch)'
             echo '- Retention: Fujian targeted deltas and six-hour nationwide checkpoints'
             if [[ -f "${PHASE7_ROOT}/phase6_report.json" ]]; then
               python - <<'PY'
